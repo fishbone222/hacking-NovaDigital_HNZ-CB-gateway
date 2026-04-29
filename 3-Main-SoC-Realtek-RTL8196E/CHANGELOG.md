@@ -6,6 +6,217 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.2.0] - 2026-04-28
+
+Two reliability fixes that touch core boot infrastructure: the
+`boothold && reboot` mechanism becomes 100 % reliable on Linux 6.18,
+and the front-panel button handler is hardened against spurious
+long-press detection. Because the bootloader's HOLD address changed,
+**this release requires a fullflash** when upgrading from v3.1.x or
+earlier — per-partition upgrade across this boundary is unsupported.
+
+### Bootloader V2.6 + `boothold` — move HOLD flag to high DRAM (0x01FFEFFC)
+
+The boot-hold mechanism (Linux writes a magic word to a fixed DRAM
+address; bootloader reads it after watchdog reset and stops at the
+`<RealTek>` prompt) regressed on Linux 6.18: at the v2.x address
+`0x003FFFFC` it hit ~73-87 % reliability instead of the 100 % we got
+on Linux 5.10. The kernel was scribbling low DRAM during early init
+or shutdown, before the `reserved-memory no-map` declaration is
+enforced — independent of `boothold` itself (the helper binary is
+bit-identical between v3.0.1 and v3.1.1).
+
+Bisection across v2.1.6 / v3.0.0 / v3.1.1 with mixed kernel/userland
+combinations pinned the regression to the 5.10 → 6.18 transition (and
+its toolchain refresh). Mitigations attempted at the original address
+(`mmap` + `O_SYNC`, `__sync_synchronize`, `usleep` between write and
+reboot) did not break 80 % reliability — the conflict is in the
+kernel's memory access patterns, not the cache path.
+
+The fix moves HOLD to the page just below the btcode stack
+(`0x01FFEFFC` — high DRAM, 32 MB − 8 KB) and reserves it in the device
+tree as `reserved-memory` with `no-map`:
+
+* `31-Bootloader/boot/main.c` — read `BOOTHOLD_RAM = 0xA1FFEFFC` (KSEG1
+  uncached), clear it before `goToDownMode()`. Bootloader bumps to
+  **V2.6** (was V2.5).
+* `34-Userdata/boothold/boothold.c` — `pwrite(/dev/mem, ..., 0x01FFEFFC)`.
+  Helper itself is simpler than v3.1.1 — no cache flushes, no
+  `O_SYNC` dance: the new address is in a `no-map` page, the kernel
+  never touches it, and KSEG1 from the bootloader bypasses cache.
+* `32-Kernel/files-6.18/arch/mips/boot/dts/realtek/rtl8196e.dts` —
+  new `boothold@1ffe000` reserved-memory node (4 KB, `no-map`).
+* `31-Bootloader/doc/REBOOT_TO_BOOTLOADER.md` — full rewrite with
+  the regression analysis, address-safety map, and upgrade path.
+
+Validated at the new address: **30 / 30 = 100 %** of `boothold &&
+reboot` cycles enter download mode on v3.2.0 (vs 22 / 30 = 73 % on
+v3.1.1 at the old address).
+
+**Upgrade path: fullflash required.** A bootloader V2.5 + boothold
+v3.2.0 mismatch (or vice versa) leaves `boothold && reboot`
+non-functional, since they read/write different addresses. Use:
+
+```
+./flash_install_rtl8196e.sh -y <gateway-IP>
+```
+
+(`flash_remote.sh` per-partition upgrades across the v3.1.1 →
+v3.2.0 boundary will not work.)
+
+### `S40button` — defense-in-depth against spurious long-press
+
+`S40button` polls GPIO 9 every 100 ms and fires `recover_efr32` on a
+5 s sustained press. The poll loop trusted the GPIO data register
+without checking that the line had ever been observed HIGH, that a
+single LOW reading could be a noise sample, or that the pin mux was
+still in GPIO mode. Any of those could in principle synthesise a
+phantom long-press and reset the EFR32 from thin air.
+
+Four mitigations land together as defense-in-depth, none of them
+trusting the others:
+
+1. **Edge detection** — start disarmed; only count LOWs after observing
+   a HIGH on GPIO 9. Guards against a stuck-low pin or wrong pin mux at
+   startup.
+2. **Debounce** — require 3 consecutive LOW polls (~300 ms) before
+   treating it as a real press. Filters single-sample noise.
+3. **Mux re-verification** — before counting a press, re-read CNR. If
+   GPIO 9 was flipped back to peripheral mode at runtime, restore GPIO
+   mode, log it, and require re-arming via HIGH.
+4. **Logging** — every state transition (armed, press, release, mux
+   flip, long-press fire) goes through `logger -t S40button` for
+   post-mortem diagnostics.
+
+Behaviour on a healthy board is unchanged — a real 5 s long-press
+still triggers `recover_efr32 -q`. Edge cases that previously could
+fire spuriously now stay silent and leave a syslog trace.
+
+> **Note on [discussion #89](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/discussions/89).**
+> An early hypothesis suggested `S40button` misfiring might be
+> behind the EFR32 dropping out after ~1 h on @olivluca's OT-RCP
+> gateway (`Reset info: 0x301 (PIN)` traces). The A/B test
+> (`/userdata/etc/init.d/S40button stop` for several hours) showed
+> no `S40button` or `nrst_pulse` log entries before the failure,
+> and the `PIN` reset was confirmed to be the normal pulse from
+> `recover_efr32` during `S70otbr` startup. **`S40button` is
+> exonerated** for #89; the actual failure (HDLC parse errors →
+> Spinel timeout) is still being investigated. The hardening above
+> ships anyway as defensive cleanup of a path that was relying on
+> too many implicit assumptions.
+
+### Flash scripts — SSH auth UX (issue #90)
+
+`lib/ssh.sh` carried `BatchMode=yes` since v3.1.0 to defuse a 17-min
+hang seen during the 5-baud NCP loop test. Side effect: silently
+fails on encrypted private keys not loaded in `ssh-agent`, and
+forbids password prompts entirely — leaving users without a key with
+no path forward (reported by @skinkie).
+
+The original hang was at the transport layer (`ssh root@gw 'true'`
+stuck on a half-broken TCP), not at auth. `ConnectTimeout=5` +
+`ServerAliveInterval=3` + `ServerAliveCountMax=2` already cover that.
+`BatchMode=yes` was a redundant belt-and-braces that turned out to
+bite users.
+
+* **Drop `BatchMode=yes`** — auth-time prompts now go through (once).
+* **Centralise SSH ControlMaster in `lib/ssh.sh`** — was previously
+  duplicated in `flash_install_rtl8196e.sh` and `flash_remote.sh`,
+  absent from `flash_efr32.sh`. Per-script `mktemp -d` socket dir
+  (mode 0700, `${UID}-$$`-keyed) avoids collisions between concurrent
+  runs and between users on a shared host.
+* **`ssh_cleanup_multiplex` helper** — sends `-O exit` to every live
+  master, drops the tmpdir. Idempotent; callers chain it into their
+  existing EXIT trap.
+
+User-visible result:
+
+| Setup | Before | After |
+|---|---|---|
+| Key in agent (or no passphrase) | works | works (unchanged) |
+| Encrypted key, no agent | silent "Permission denied" | passphrase prompted **once** |
+| Root password only | silent "Permission denied" | password prompted **once** |
+| stdin closed (CI) | silent fail | fails immediately after timeout |
+
+The "once" comes from ControlMaster — every script does N back-to-back
+SSH calls, all of which now ride a single multiplexed channel.
+
+For full **non-interactive automation with password only** (CI, scripted
+runs without a tty), a new `SSH_PASSWORD` env var feeds the password to
+ssh via `sshpass`. The new `ssh_prime_with_password` helper in
+`lib/ssh.sh` opens the ControlMaster up-front using `sshpass -e`;
+subsequent ssh calls ride the multiplexed channel as usual. `sshpass`
+is checked as a hard dependency only when `SSH_PASSWORD` is set;
+interactive runs without it remain prompt-driven and don't need
+`sshpass` installed.
+
+```sh
+# Interactive (default): ssh prompts, you type once
+./flash_efr32.sh -y -g 192.168.1.88 ncp
+
+# Non-interactive (no tty): SSH_PASSWORD is fed via sshpass
+SSH_PASSWORD=root ./flash_efr32.sh -y -g 192.168.1.88 ncp
+```
+
+README's "What You Need" gains an explicit SSH access section
+documenting the four modes (key in agent / encrypted key / interactive
+password / non-interactive `SSH_PASSWORD`).
+
+### `flash_install_rtl8196e.sh` — show user-chosen IP in post-install hints (issue #90)
+
+The IP prompted at first-flash (default `192.168.1.88`, but @skinkie
+typed `192.168.5.252`) was set inside `build_fullflash.sh`'s subshell
+and never propagated back to the parent. The four post-install hint
+lines fell through to the hardcoded default — telling users to
+`ssh root@192.168.1.88` for a gateway that lives at `.5.252`. The
+final `Flash with: ./flash_efr32.sh <IP>` hint additionally used the
+v3.0 positional syntax dropped in v3.1.0 — that command now errors.
+
+* Pre-create `SKEL_WORK` in the parent on first-flash too, so
+  `build_fullflash.sh` writes `eth0.conf` into a dir the parent owns.
+* Read `IPADDR` back from the generated `eth0.conf` after the build
+  returns; introduce `GW_HINT_IP` resolved from `LINUX_IP` (upgrade)
+  or `IPADDR` (first-flash) or the default.
+* Rewrite the final hint to the current CLI shape:
+  `./flash_efr32.sh -g <IP> ncp` (or `otrcp` when MODE=otbr).
+
+### `flash_efr32.sh` — always use the pinned venv USF (issue #92)
+
+Reported by @skinkie: `universal-silabs-flasher` exits with
+`Error: No such option: --probe-methods Did you mean
+--probe-method?` on a host that already has USF installed in
+`~/.local/bin`.
+
+The script's USF resolution preferred `command -v
+universal-silabs-flasher` over the venv install — so any USF in
+`$PATH` short-circuited the install path. Older USF releases use
+`--probe-method` (singular, no comma-list) and none of them carry
+our `DEFAULT_PROBE_METHODS` patch (extra bauds for EZSP / SPINEL /
+CPC at 230400 / 691200 / 892857). The script then called the system
+binary with the new CLI shape and patched bauds it didn't have.
+
+Fix:
+
+* Always use the pinned venv (USF 1.0.3 + our probe-methods patch).
+  The system USF is ignored even when present.
+* New `USF_ALLOW_SYSTEM=1` env var as an explicit escape hatch for
+  operators who really want to point at a system install — with a
+  warning that probe results may differ.
+
+### Documentation
+
+- `31-Bootloader/doc/REBOOT_TO_BOOTLOADER.md` — full rewrite
+  (mechanism, address rationale, regression analysis table,
+  upgrade-path note for the v3.1.1 → v3.2.0 fullflash boundary).
+- `boothold.c` header — English narrative of the regression and
+  why the new address is reliable.
+- README "What You Need" — three SSH access modes (key / encrypted
+  key / password), default password reminder.
+- Per-version banners (`/etc/version`, `/etc/motd`, bootloader
+  print) updated to v3.2.0 / V2.6.
+
+---
+
 ## [3.1.1] - 2026-04-27
 
 Hardening pass on the kernel UART bridge and a few operator-facing

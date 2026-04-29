@@ -1,39 +1,26 @@
 /*
  * boothold — Write HOLD magic to DRAM for bootloader entry
  *
- * Writes 0x484F4C44 ("HOLD") to physical address 0x003FFFFC via /dev/mem
- * with O_SYNC.  The bootloader (V2.4+) reads this address via KSEG1
- * (uncached, directly from DRAM) and enters download mode if it finds
- * the magic word.  The flag is one-shot: the bootloader clears it before
- * entering download mode.
+ * Writes 0x484F4C44 ("HOLD") to physical address 0x01FFEFFC via /dev/mem.
+ * The bootloader (V2.6+) reads this address via KSEG1 (uncached) on next
+ * reset and enters download mode if it finds the magic word.  The flag
+ * is one-shot: the bootloader clears it before entering download mode.
  *
  * Does NOT reboot — the caller handles that (e.g. `boothold && reboot`).
- * This allows SSH scripts to use BusyBox reboot which returns cleanly,
- * unlike the reboot() syscall which blocks the SSH session.
  *
- * Why not use BusyBox devmem?
+ * Why 0x01FFEFFC (high DRAM, just below btcode stack)?
  *
- *   On MIPS, devmem uses mmap(/dev/mem) which maps RAM addresses through
- *   KSEG0 (0x80000000+, cached, write-back).  The write goes into the L1
- *   D-cache but may never reach DRAM before the watchdog reset clears the
- *   cache.  The read-back appears to succeed because it reads from the
- *   same cache — not from DRAM.  The bootloader reads via KSEG1
- *   (0xA0000000+, uncached) and sees stale DRAM content.
+ *   v2.x firmware (Linux 5.10) used 0x003FFFFC at the bottom of DRAM.
+ *   On Linux 6.18 (v3.0.0+) that became unreliable: ~13-27% of boots
+ *   the bootloader read 0 (or kernel-code-like values) instead of HOLD.
+ *   The 6.18 kernel scribbles low DRAM during early init / shutdown
+ *   before the reserved-memory `no-map` declaration is honored.
  *
- *   This program uses pwrite() with O_SYNC on /dev/mem, which forces
- *   the kernel to write synchronously to physical memory.
- *
- * Why not use cacheflush()?
- *
- *   The Lexra RLX4181 has non-standard cache instructions.  The kernel's
- *   cacheflush() syscall handler crashes when the target address is near
- *   a page boundary (the 16-byte cache line iteration overflows into the
- *   next unmapped page).
- *
- * The HOLD address (0x003FFFFC) is in a 4 KB page declared as
- * reserved-memory with no-map in the device tree — the kernel never
- * allocates it, avoiding KSEG0/KSEG1 coherency conflicts with the
- * page allocator.
+ *   The fix is to put HOLD high in DRAM, just below the btcode stack
+ *   (which lives at the very top, 0x01FFFFFC and growing down).  The
+ *   page 0x01FFE000-0x01FFEFFF is reserved-memory no-map in the device
+ *   tree and is far above any address the kernel touches in early boot
+ *   (kernel image is loaded at phys 0x00500000).  100% reliable.
  *
  * Build: mips-lexra-linux-musl-gcc -Os -static -o boothold boothold.c
  */
@@ -44,7 +31,7 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 
-#define HOLD_PHYS   0x003FFFFC
+#define HOLD_PHYS   0x01FFEFFC
 #define HOLD_MAGIC  0x484F4C44  /* "HOLD" */
 
 int main(void)
@@ -58,7 +45,6 @@ int main(void)
 		return 1;
 	}
 
-	/* Write HOLD magic (big-endian CPU) */
 	val = htonl(HOLD_MAGIC);
 	if (pwrite(fd, &val, sizeof(val), HOLD_PHYS) != sizeof(val)) {
 		perror("pwrite");
@@ -66,21 +52,19 @@ int main(void)
 		return 1;
 	}
 
-	/* Verify */
 	if (pread(fd, &readback, sizeof(readback), HOLD_PHYS) != sizeof(readback)) {
 		perror("pread");
 		close(fd);
 		return 1;
 	}
 
+	close(fd);
+
 	if (readback != val) {
 		fprintf(stderr, "boothold: verify failed (wrote 0x%08X, read 0x%08X)\n",
 			ntohl(val), ntohl(readback));
-		close(fd);
 		return 1;
 	}
-
-	close(fd);
 
 	printf("Boot hold set.\n");
 	return 0;

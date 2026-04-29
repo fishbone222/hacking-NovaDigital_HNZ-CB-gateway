@@ -10,9 +10,9 @@ ESC on the serial console.
 boothold && reboot
 ```
 
-The `boothold` binary writes the HOLD magic to DRAM via `pwrite()` + `O_SYNC`
-(bypasses the CPU write-back cache).  The flag is **one-shot**: the bootloader
-clears it before entering download mode, so the next reboot boots Linux normally.
+The `boothold` binary writes the HOLD magic word to a fixed location in
+DRAM and exits.  The flag is **one-shot**: the bootloader clears it
+before entering download mode, so the next reboot boots Linux normally.
 
 ---
 
@@ -21,15 +21,15 @@ clears it before entering download mode, so the next reboot boots Linux normally
 The mechanism uses a **magic word in DRAM** that survives the
 watchdog reset triggered by `reboot`.  No flash writes are involved.
 
-1. Linux writes `0x484F4C44` ("HOLD") to physical address `0x003FFFFC`
-   via `/dev/mem`.
+1. Linux writes `0x484F4C44` ("HOLD") to physical address
+   `0x01FFEFFC` via `/dev/mem`.
 2. Linux triggers `reboot`, which causes a watchdog reset.
 3. The CPU restarts at `BFC00000` (flash reset vector).  The btcode
    re-initialises the DDR controller, but DRAM cell contents survive
    because the DDR2 retention time (~64-256 ms) exceeds the re-init
    delay (~1-2 ms).
-4. The stage-2 bootloader checks `0x803FFFFC` (kseg0 cached alias of
-   physical `0x003FFFFC`) for the magic word.
+4. The stage-2 bootloader checks `0xA1FFEFFC` (KSEG1 uncached alias of
+   physical `0x01FFEFFC`) for the magic word.
 5. If it matches, the bootloader **clears it** and enters
    download mode (`goToDownMode()`).
 6. If it doesn't match (normal boot, cold power-on), the bootloader
@@ -56,36 +56,70 @@ doBooting()
 
 ## DRAM address selection
 
-### Why 0x003FFFFC with reserved-memory
+### Why 0x01FFEFFC (high DRAM, one page below the btcode stack)
 
-Physical `0x003FFFFC` is safe from all btcode early-boot code (DDR
-calibration, decompressor, TFTP).  However, the kernel's page allocator
-normally uses this page — writing through KSEG0 (cached) overwrites any
-value written by `devmem` through KSEG1 (uncached), a classic
-KSEG0/KSEG1 cache coherency conflict.
+The flag must satisfy three constraints:
 
-The fix: the device tree declares this page as `reserved-memory` with
-`no-map`.  The kernel never allocates it — no cache lines, no conflict.
-`devmem` writes persist reliably.
+1. The bootloader (btcode + stage-2) must not write to it during early
+   boot — otherwise it gets clobbered before the HOLD check runs.
+2. The Linux kernel must not write to it while running, nor during
+   shutdown / reboot — otherwise the magic written by `boothold` is
+   lost before the watchdog reset takes effect.
+3. The bootloader's HOLD check (KSEG1 uncached read) must agree with
+   whatever path Linux uses to write it — otherwise cache coherency
+   bites.
 
-**Top of DRAM (`0x01FFFFFC`) is NOT safe**: the btcode initialises the
-stack pointer at the top of RAM (`0x82000000`) and pushes data starting
-at `0x81FFFFFC` during DDR calibration — producing false positives on
-every boot, including cold power-on.
+The page `0x01FFE000–0x01FFEFFF` (4 KB at 32 MB − 8 KB) sits in a
+narrow but reliable window:
 
-### Address safety
+- **Above** the kernel image, kernel BSS/data, and any low-DRAM
+  scratch the kernel touches during early init.  The kernel is loaded
+  at phys `0x00500000` and never grows past ~24 MB even with maximum
+  rootfs/userdata cache pressure.
+- **Below** the btcode stack, which initialises at top-of-RAM
+  (`0x82000000`) and grows down through `0x81FFFFFF` (= phys
+  `0x01FFFFFC`).  In practice the stack uses well under 4 KB, so
+  the page just below the stack page is untouched.
+- **Reserved** in the device tree as `reserved-memory` with `no-map`,
+  so the kernel page allocator skips it and there's no MMU mapping —
+  no KSEG0/KSEG1 coherency conflict, no cache aliasing risk.
 
-| Region                          | Address range              | Status    |
-|---------------------------------|----------------------------|-----------|
-| Exception vectors               | `0x80000000 - 0x800001FF` | Avoid     |
-| DDR calibration (`DDR_cali_API7`, `Calc_TRxDly`) | `0xA0080000`, `0xA0100000` | Avoid |
-| DDR size detection (`Calc_Dram_Size`) | `0xA0000000`, power-of-2 offsets up to `0xA4000000` | Avoid |
-| Stage-1.5 (piggy)              | `0x80100000+`              | Avoid     |
-| LZMA workspace                  | `0x80300000`               | Avoid     |
-| **Boot-hold flag**              | **`0x803FFFFC`**           | **Used**  |
-| Stage-2 code/data/BSS           | `0x80400000 - 0x80422000` | Avoid     |
-| TFTP load area                  | `0x80500000 - 0x81500000` | Avoid     |
-| btcode stack (grows down)       | `0x81FFFFFC` and below     | Avoid     |
+### Why not 0x003FFFFC (the v2.x location)?
+
+v2.x firmware (Linux 5.10) put the flag at `0x003FFFFC`, near the
+*bottom* of DRAM.  This was reliable on the 5.10 kernel.  Starting
+with Linux 6.18 (v3.0.0+) it became unreliable:
+
+| Stack | HOLD address | `boothold && reboot` reliability |
+|---|---|---|
+| v2.1.6 (Linux 5.10) | 0x003FFFFC | 30/30 = 100% |
+| v3.0.0 (Linux 6.18) | 0x003FFFFC | 26/30 = 87% |
+| v3.1.1 (Linux 6.18) | 0x003FFFFC | 22/30 = 73% |
+| **v3.2.0 (Linux 6.18)** | **0x01FFEFFC** | **30/30 = 100%** |
+
+On failed boots, the bootloader read either zero or kernel-code-like
+values (e.g. `0xFFFFFFFC`, `0x00001000`) — symptoms of the kernel
+scribbling low DRAM before the `reserved-memory no-map` declaration
+takes effect.  The 5.10 → 6.18 jump (with its accompanying toolchain
+refresh) changed the early-init memory access patterns; the bisection
+in the v3.2.0 fix narrowed the regression to that kernel transition.
+
+Moving the flag to high DRAM eliminates the conflict regardless of
+which exact path the kernel takes through low memory during boot or
+shutdown.
+
+### Address safety map
+
+| Region                                  | Address range                    | Status    |
+|-----------------------------------------|----------------------------------|-----------|
+| Exception vectors                       | `0x80000000 – 0x800001FF`       | Avoid     |
+| DDR calibration                         | low DRAM scratch                | Avoid     |
+| DDR size detection                      | power-of-2 offsets in `0xA0000000` window | Avoid |
+| Stage-1.5 piggy decompressor scratch    | `0x80100000+`                   | Avoid     |
+| LZMA workspace                          | `0x80300000`                    | Avoid     |
+| Kernel image (loaded by btcode)         | `0x80500000 – ~0x81E00000`      | Avoid     |
+| **Boot-hold flag**                      | **`0x81FFEFFC`** (KSEG0)        | **Used**  |
+| btcode stack page (grows down from top) | `0x81FFF000 – 0x81FFFFFF`       | Avoid     |
 
 ---
 
@@ -95,7 +129,7 @@ In `boot/main.c`, at file scope:
 
 ```c
 #define BOOTHOLD_MAGIC  0x484F4C44  /* "HOLD" */
-#define BOOTHOLD_RAM    ((volatile unsigned long *)0x803FFFFC)
+#define BOOTHOLD_RAM    ((volatile unsigned long *)0xA1FFEFFC)
 ```
 
 In `start_kernel()`, after `showBoardInfo()`:
@@ -109,11 +143,27 @@ if (BOOTHOLD_RAM[0] == BOOTHOLD_MAGIC) {
 }
 ```
 
+The pointer uses KSEG1 (`0xA1FFEFFC`), not KSEG0 (`0x81FFEFFC`), so
+both the read and the clear bypass the L1 D-cache and go directly to
+DRAM.  Without this, the clear (write 0) could stay in the cache and
+be lost on power cycle, producing a false boot-hold on every cold
+boot.
+
+### Upgrading from v3.1.1 or earlier
+
+The HOLD address changed in v3.2.0 (bootloader V2.6).  Bootloader and
+`boothold` binary must be upgraded together; a mismatch (old bootloader
++ new boothold, or vice versa) leaves `boothold && reboot`
+non-functional.  Always upgrade via fullflash
+(`./flash_install_rtl8196e.sh -y <gateway-IP>`) when crossing the
+v3.1.1 → v3.2.0 boundary.  Per-partition upgrade across this boundary
+is unsupported.
+
 ---
 
 ## Kernel device tree reservation
 
-In `rtl8196e.dts`:
+In `arch/mips/boot/dts/realtek/rtl8196e.dts`:
 
 ```dts
 memory@0 {
@@ -126,8 +176,8 @@ reserved-memory {
     #size-cells = <1>;
     ranges;
 
-    boothold@3ff000 {
-        reg = <0x003FF000 0x1000>;  /* 4KB reserved for boothold flag */
+    boothold@1ffe000 {
+        reg = <0x01FFE000 0x1000>;  /* 4KB reserved for boothold flag */
         no-map;
     };
 };
@@ -137,6 +187,12 @@ The `no-map` property removes this page from `memblock` before the page
 allocator starts — no runtime cost, no exception handling.  On MIPS,
 KSEG0/KSEG1 are hardware-mapped (no TLB), so `/dev/mem` access still
 works.  The 4 KB cost (0.01% of 32 MB) is negligible.
+
+The kernel boot log confirms the reservation:
+
+```
+OF: reserved mem: 0x01ffe000..0x01ffefff (4 KiB) nomap non-reusable boothold@1ffe000
+```
 
 ---
 
@@ -148,12 +204,17 @@ works.  The 4 KB cost (0.01% of 32 MB) is negligible.
 boothold && reboot
 ```
 
-The `boothold` binary (installed in `/userdata/usr/bin/`) uses `pwrite()` with
-`O_SYNC` on `/dev/mem` to write the HOLD magic directly to DRAM, bypassing the
-CPU write-back cache.
+The `boothold` binary (installed in `/usr/bin/`) uses `pwrite()` on
+`/dev/mem` to write the HOLD magic to physical address `0x01FFEFFC`.
 
-**Do not use `devmem`** — it maps RAM through KSEG0 (cached, write-back) via
-`mmap()`.  The write may stay in the L1 D-cache and be lost on watchdog reset.
+### Manual / one-liner alternative
+
+```sh
+devmem 0x01FFEFFC 32 0x484F4C44 && reboot
+```
+
+This works because the address is in a `reserved-memory no-map` page —
+the kernel never caches or touches it from the page allocator side.
 
 ---
 
@@ -163,9 +224,8 @@ Tested on the Lidl Silvercrest gateway (RTL8196E, 32 MB DDR2):
 
 | Test | Result |
 |------|--------|
-| DRAM retention across watchdog reset | **Survives** — magic at `0x803FFFFC` preserved after reset |
-| Boot-hold from Linux SSH (`devmem` + `reboot`) | **Works** — bootloader prints `---Boot hold requested` and enters `<RealTek>` prompt |
-| Value persistence (kernel running) | **Works** — page excluded from allocator via reserved-memory no-map |
+| DRAM retention across watchdog reset | **Survives** — magic at `0x01FFEFFC` preserved |
+| Boot-hold from Linux SSH on Linux 6.18 | **30/30 = 100%** at the new address |
 | One-shot behavior (subsequent reboot) | **Works** — flag is cleared, Linux boots normally |
 | Full power cycle (disconnect all cables) | **Flag cleared** — DRAM lost, normal boot |
 
@@ -173,19 +233,25 @@ Tested on the Lidl Silvercrest gateway (RTL8196E, 32 MB DDR2):
 
 ## Design alternatives considered
 
-### Top of DRAM (0x01FFFFFC)
+### Top of DRAM (last page, `0x01FFF000–0x01FFFFFF`)
 
-Attempted: reduce DT memory size by 4 KB to exclude the last page.
-Failed: the btcode stack starts at top of RAM and writes data there
-during DDR calibration on every boot (including cold power-on),
-producing false HOLD detections.
+Rejected: the btcode initialises the stack pointer at `0x82000000` and
+pushes data into the page at `0x81FFFFFC` during DDR calibration on
+every boot (including cold power-on), producing false HOLD detections.
+The page one below (the current location) is far enough that even deep
+stack frames don't reach it.
+
+### Low DRAM (`0x003FFFFC`, the v2.x location)
+
+Rejected on v3.x: see the regression analysis above.  Unreliable on
+Linux 6.18 due to the kernel scribbling low DRAM during early init or
+shutdown, before the `no-map` reservation is enforced.
 
 ### Flash-based flag
 
-Write a 4-byte magic to flash offset `0x1FFF0` (last sector of mtd0).
-The bootloader reads it, clears it via sector read-modify-write, and
-enters download mode.  This is guaranteed to work regardless of DRAM
-retention but causes one flash erase+write cycle per use.
+Write a 4-byte magic to flash (e.g. last sector of mtd0), bootloader
+reads and clears it via sector read-modify-write.  Guaranteed to
+survive any DRAM corruption but causes one flash erase+write cycle per
+use — needless wear when DRAM works reliably at the new address.
 
-Not implemented — DRAM approach works reliably on this hardware and
-avoids flash wear entirely.
+Not implemented.

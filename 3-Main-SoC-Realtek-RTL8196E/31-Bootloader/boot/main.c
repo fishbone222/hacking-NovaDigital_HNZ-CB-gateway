@@ -31,10 +31,22 @@ unsigned int gCHKKEY_CNT = 0;
  * The flag is one-shot: the bootloader clears it before entering
  * download mode.
  *
- * Address 0xA03FFFFC = KSEG1 (uncached) alias of physical 0x003FFFFC,
- * inside a 4 KB page (0x003FF000–0x003FFFFF) declared as
- * reserved-memory with no-map in the device tree.  The kernel never
- * allocates this page — no KSEG0/KSEG1 coherency conflict.
+ * Address 0xA1FFEFFC = KSEG1 (uncached) alias of physical 0x01FFEFFC,
+ * inside a 4 KB page (0x01FFE000–0x01FFEFFF) declared as
+ * reserved-memory with no-map in the device tree.  The kernel page
+ * allocator skips this page — no KSEG0/KSEG1 coherency conflict.
+ *
+ * Why HIGH in DRAM and not at 0x003FFFFC like in v2.x?
+ *
+ *   On Linux 5.10 (v2.x), HOLD at 0x003FFFFC was reliable.  On Linux
+ *   6.18 (v3.0.0+), the bootloader started reading garbage / zeros
+ *   from that address ~13-27% of the time — symptoms consistent with
+ *   the kernel scribbling low DRAM during early init or shutdown,
+ *   before the reserved-memory no-map declaration takes effect.
+ *   Moving HOLD just below the btcode stack (which lives at the very
+ *   top of DRAM) puts it well above the kernel image (loaded at
+ *   phys 0x00500000) and above any plausible early-boot scratch use
+ *   of low memory.  100% reliable in testing.
  *
  * KSEG1 is used (not KSEG0) so that both the read and the clear
  * bypass the cache and go directly to DRAM.  Without this, the
@@ -42,9 +54,11 @@ unsigned int gCHKKEY_CNT = 0;
  * power cycle — causing a false boot-hold on every cold boot.
  *
  * Top of DRAM (0x81FFFFFC) is NOT safe: btcode stack starts there.
+ * 0x01FFEFFC is one 4KB page below the stack, well clear of stack
+ * usage on this minimal bootloader.
  */
 #define BOOTHOLD_MAGIC  0x484F4C44  /* "HOLD" */
-#define BOOTHOLD_RAM    ((volatile unsigned long *)0xA03FFFFC)
+#define BOOTHOLD_RAM    ((volatile unsigned long *)0xA1FFEFFC)
 
 void goToDownMode(void);
 

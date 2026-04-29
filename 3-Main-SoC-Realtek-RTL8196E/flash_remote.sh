@@ -16,12 +16,16 @@
 #   -y, --yes   Non-interactive mode: skip all confirmation prompts
 #
 # Environment variables (optional overrides):
-#   BOOT_IP     - Gateway IP in bootloader mode (default: 192.168.1.6)
-#   SSH_USER    - SSH username (default: root)
-#   SSH_TIMEOUT - TCP probe timeout in seconds (default: 2)
-#   NET_MODE    - "static" or "dhcp" (skip network prompt, userdata only)
-#   RADIO_MODE  - "zigbee" or "thread" (skip radio prompt, userdata only)
-#   CONFIRM     - Set to "y" to skip confirmation prompts (same as -y)
+#   BOOT_IP      - Gateway IP in bootloader mode (default: 192.168.1.6)
+#   SSH_USER     - SSH username (default: root)
+#   SSH_TIMEOUT  - TCP probe timeout in seconds (default: 2)
+#   SSH_PASSWORD - Root password for non-interactive auth (CI / no tty).
+#                  When set, the first ssh call is fed via sshpass and the
+#                  ControlMaster takes over for the rest. Requires sshpass
+#                  (sudo apt install sshpass).
+#   NET_MODE     - "static" or "dhcp" (skip network prompt, userdata only)
+#   RADIO_MODE   - "zigbee" or "thread" (skip radio prompt, userdata only)
+#   CONFIRM      - Set to "y" to skip confirmation prompts (same as -y)
 #
 # J. Nilo - March 2026
 
@@ -51,7 +55,7 @@ usage() {
     echo "  -y, --yes   Non-interactive mode (skip all prompts)"
     echo ""
     echo "Environment: BOOT_IP (default: 192.168.1.6), SSH_USER, SSH_TIMEOUT,"
-    echo "  NET_MODE, RADIO_MODE, CONFIRM"
+    echo "  SSH_PASSWORD (sshpass), NET_MODE, RADIO_MODE, CONFIRM"
     exit 1
 }
 
@@ -138,21 +142,32 @@ echo "Gateway is running Linux at ${LINUX_IP}:${SSH_PORT}."
 # shellcheck disable=SC1091
 . "${SCRIPT_DIR}/../lib/ssh.sh"
 
-SSH_SOCK="/tmp/remote_flash_ssh_$$"
+# sshpass is only required when SSH_PASSWORD is set (non-interactive
+# password auth — see lib/ssh.sh:ssh_prime_with_password).
+if [ -n "${SSH_PASSWORD:-}" ] && ! command -v sshpass >/dev/null 2>&1; then
+    echo "Error: SSH_PASSWORD is set but sshpass is not installed." >&2
+    echo "Install it with: sudo apt install sshpass" >&2
+    exit 1
+fi
+
 # StrictHostKeyChecking=no + /dev/null known_hosts is intentional here:
 # this workflow targets gateways that may have just been re-flashed, so
-# host keys churn legitimately. ControlMaster reuses one TCP connection
-# for the back-to-back commands below.
+# host keys churn legitimately. ControlMaster comes from lib/ssh.sh, which
+# also handles cleanup at exit (chained below).
 SSH_OPTS=(
     "${SSH_HARDEN_OPTS[@]}"
     -o StrictHostKeyChecking=no
     -o UserKnownHostsFile=/dev/null
-    -o ControlMaster=auto
-    -o ControlPath="$SSH_SOCK"
-    -o ControlPersist=60
     -p "$SSH_PORT"
 )
 SSH_TARGET="${SSH_USER}@${LINUX_IP}"
+trap 'ssh_cleanup_multiplex' EXIT
+
+# Open the ControlMaster up-front using SSH_PASSWORD if provided
+# (no-op when SSH_PASSWORD is unset — ssh's tty prompt handles it).
+if ! ssh_prime_with_password "${SSH_OPTS[@]}" "$SSH_TARGET"; then
+    exit 1
+fi
 
 # Verify SSH access (opens ControlMaster connection)
 if ! ssh_retry "${SSH_OPTS[@]}" "$SSH_TARGET" "true" 2>/dev/null; then
@@ -175,7 +190,7 @@ if [ "$COMPONENT" = "userdata" ]; then
     # Work on a temporary copy of the skeleton — never modify the original
     SKEL_WORK=$(mktemp -d)
     cp -a "${FLASH_DIR}/skeleton/." "$SKEL_WORK/"
-    trap 'rm -rf "$SKEL_WORK"' EXIT
+    trap 'rm -rf "$SKEL_WORK"; ssh_cleanup_multiplex' EXIT
     export SKELETON_DIR="$SKEL_WORK"
 
     SAVE_TAR=$(mktemp)
@@ -201,8 +216,8 @@ echo "Sending boothold + reboot..."
 # BusyBox reboot signals init and returns — SSH session closes cleanly
 ssh_retry "${SSH_OPTS[@]}" "$SSH_TARGET" "boothold && reboot" 2>/dev/null || true
 # Close ControlMaster socket — gateway is rebooting, stale connection
-# would interfere with shutdown detection
-ssh -O exit -o ControlPath="$SSH_SOCK" "$SSH_TARGET" 2>/dev/null || true
+# would interfere with shutdown detection.
+ssh_cleanup_multiplex
 
 # --- step 5: wait for bootloader -------------------------------------------
 # Two-phase wait to avoid ARP false positives (Linux responds to ARP for

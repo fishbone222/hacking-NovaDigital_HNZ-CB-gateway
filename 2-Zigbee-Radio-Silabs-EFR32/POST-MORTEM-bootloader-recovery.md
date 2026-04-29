@@ -322,7 +322,7 @@ sequence to trip an external-pin reset on the radio chip.
 
 The likely mechanism: the chip-reset default of `PIN_MUX_SEL_2` on the
 RTL8196E includes one or more of bits {7, 10, 13} set. During the
-window between the SoC CPU reset and `V2.5 bootloader: swCore.c:442`
+window between the SoC CPU reset and `V2.5+ bootloader: swCore.c:442`
 explicitly clearing the register, `nRST` is held LOW. That window is
 on the order of milliseconds — comfortably above the EFR32 Series 1
 minimum `nRST` hold time (a few µs) — which is why the reset is
@@ -332,7 +332,7 @@ reliable rather than flaky.
 |---|---|---|
 | Steady-state (kernel running) | `0x1A` (LED bits only) | released |
 | Linux runs `reboot`, CPU resets | reverts to chip-reset default — empirically nRST-asserting | **LOW for several ms** |
-| V2.5 bootloader runs `swCore.c:442` | explicit `REG32(PIN_MUX_SEL2) = 0` | released → EFR32 boots fresh |
+| V2.5+ bootloader runs `swCore.c:442` | explicit `REG32(PIN_MUX_SEL2) = 0` | released → EFR32 boots fresh |
 | Kernel boots, `rtl8196e-eth` probes | `0x1A` (LED bits added) | released, EFR32 already running new app |
 
 So **a plain `reboot` from Linux is the recovery mechanism Alternative
@@ -395,7 +395,7 @@ case in the field.
   (PIN)`, both reported by the EFR32 itself via Spinel. No kernel
   change was needed for this — the RTL8196E's chip-reset default of
   `PIN_MUX_SEL_2` apparently already drives `nRST` LOW for long enough
-  before the V2.5 bootloader's `swCore.c:442` clears it.
+  before the V2.5+ bootloader's `swCore.c:442` clears it.
 - **Phase 3 (chip-reset default of `PIN_MUX_SEL_2`) — skipped on
   cost/benefit grounds.** Three routes considered:
   - kernel patch in `rtl8196e-eth` to log the value before clearing —

@@ -40,14 +40,18 @@
 #   -y, --yes       Non-interactive mode: skip all confirmation prompts
 #
 # Environment variables:
-#   BOOT_IP     - Gateway IP in bootloader (default: 192.168.1.6)
-#   SSH_TIMEOUT - TCP probe timeout in seconds (default: 2)
-#   NET_MODE    - "static" or "dhcp" (skip network prompt)
-#   IPADDR      - Static IP address (default: 192.168.1.88)
-#   NETMASK     - Netmask (default: 255.255.255.0)
-#   GATEWAY     - Default gateway (default: 192.168.1.1)
-#   RADIO_MODE  - "zigbee" or "thread" (skip radio prompt)
-#   CONFIRM     - Set to "y" to skip confirmation prompts (same as -y)
+#   BOOT_IP      - Gateway IP in bootloader (default: 192.168.1.6)
+#   SSH_TIMEOUT  - TCP probe timeout in seconds (default: 2)
+#   SSH_PASSWORD - Root password for non-interactive auth (CI / no tty).
+#                  When set, the first ssh call is fed via sshpass and the
+#                  ControlMaster takes over for the rest. Requires sshpass
+#                  (sudo apt install sshpass).
+#   NET_MODE     - "static" or "dhcp" (skip network prompt)
+#   IPADDR       - Static IP address (default: 192.168.1.88)
+#   NETMASK      - Netmask (default: 255.255.255.0)
+#   GATEWAY      - Default gateway (default: 192.168.1.1)
+#   RADIO_MODE   - "zigbee" or "thread" (skip radio prompt)
+#   CONFIRM      - Set to "y" to skip confirmation prompts (same as -y)
 #
 # J. Nilo - March 2026
 
@@ -80,8 +84,8 @@ while [ $# -gt 0 ]; do
             echo "Options:"
             echo "  -y, --yes      Non-interactive mode (skip all prompts)"
             echo ""
-            echo "Environment: BOOT_IP, SSH_TIMEOUT, NET_MODE, RADIO_MODE, CONFIRM,"
-            echo "  IPADDR, NETMASK, GATEWAY"
+            echo "Environment: BOOT_IP, SSH_TIMEOUT, SSH_PASSWORD (sshpass),"
+            echo "  NET_MODE, RADIO_MODE, CONFIRM, IPADDR, NETMASK, GATEWAY"
             exit 0
             ;;
         --*) echo "Unknown option: $1. Use --help for usage."; exit 1 ;;
@@ -111,6 +115,10 @@ check_cmd fakeroot     fakeroot
 check_cmd gcc          gcc
 check_cmd mkfs.jffs2   mtd-utils
 check_cmd mksquashfs   squashfs-tools
+
+# sshpass is only required when SSH_PASSWORD is set (non-interactive
+# password auth — see lib/ssh.sh:ssh_prime_with_password).
+[ -n "${SSH_PASSWORD:-}" ] && check_cmd sshpass sshpass
 
 # tftp-hpa: the BSD tftp client is also called "tftp" but lacks the -c flag.
 # Capture --help output first — tftp-hpa exits 64 on --help, which under
@@ -190,22 +198,26 @@ if [ -n "$LINUX_RUNNING" ]; then
         # Port 2333 is exclusively Tuya/Lidl — no SSH needed
         fw_type="tuya"
     else
-        # Port 22 — could be custom or Tuya; SSH in to check
-        SSH_SOCK="/tmp/flash_install_ssh_$$"
+        # Port 22 — could be custom or Tuya; SSH in to check.
         # StrictHostKeyChecking=no + /dev/null known_hosts is intentional:
         # this workflow installs custom firmware over Tuya stock, so the
         # gateway's host key changes legitimately mid-flow. ControlMaster
-        # multiplexes the back-to-back commands below over one TCP session.
+        # comes from lib/ssh.sh — first call prompts for password/passphrase
+        # at most once, the rest of the back-to-back commands ride the
+        # same channel.
         FI_SSH_OPTS=(
             "${SSH_HARDEN_OPTS[@]}"
             -o StrictHostKeyChecking=no
             -o UserKnownHostsFile=/dev/null
-            -o ControlMaster=auto
-            -o ControlPath="$SSH_SOCK"
-            -o ControlPersist=10
             -p "$fw_port"
         )
         FI_SSH_TARGET="root@${fw_host}"
+
+        # Open the ControlMaster up-front using SSH_PASSWORD if provided
+        # (no-op when SSH_PASSWORD is unset — ssh's tty prompt handles it).
+        if ! ssh_prime_with_password "${FI_SSH_OPTS[@]}" "$FI_SSH_TARGET"; then
+            exit 1
+        fi
 
         # Verify SSH access before proceeding
         if ! ssh_retry "${FI_SSH_OPTS[@]}" "$FI_SSH_TARGET" "true" 2>/dev/null; then
@@ -251,7 +263,7 @@ if [ -n "$LINUX_RUNNING" ]; then
         USERDATA_SKEL="${SCRIPT_DIR}/3-Main-SoC-Realtek-RTL8196E/34-Userdata/skeleton"
         SKEL_WORK=$(mktemp -d)
         cp -a "$USERDATA_SKEL/." "$SKEL_WORK/"
-        trap 'rm -rf "$SKEL_WORK"' EXIT
+        trap 'rm -rf "$SKEL_WORK"; ssh_cleanup_multiplex' EXIT
         export SKELETON_DIR="$SKEL_WORK"
 
         SAVE_TAR=$(mktemp)
@@ -297,8 +309,9 @@ EOF
 
         echo "Sending boothold + reboot..."
         ssh_retry "${FI_SSH_OPTS[@]}" "$FI_SSH_TARGET" "boothold && reboot" 2>/dev/null || true
-        # Close ControlMaster socket — gateway is rebooting
-        ssh -O exit -o ControlPath="$SSH_SOCK" "$FI_SSH_TARGET" 2>/dev/null || true
+        # Close ControlMaster socket — gateway is rebooting, no point waiting
+        # for ControlPersist to expire on a connection that's already dead.
+        ssh_cleanup_multiplex
     else
         echo ""
         echo "Tuya firmware detected. Cannot boothold automatically."
@@ -427,8 +440,30 @@ fi
 # --- build fullflash.bin -----------------------------------------------------
 # Called with -q (quiet): only config → lines, errors, and a summary are shown.
 # Run build_fullflash.sh without -q for full verbose output.
+#
+# In the upgrade path SKELETON_DIR is already exported (with saved config
+# from the running gateway). On a first flash the parent has no SKEL_WORK
+# yet, but build_fullflash.sh will prompt for IP/radio and write into
+# whatever SKELETON_DIR points to. We pre-create one here so the parent
+# can read back the chosen IPADDR for the post-install hint, instead of
+# losing it when build_fullflash's own mktemp dir is reaped.
+if [ -z "${SKELETON_DIR:-}" ]; then
+    USERDATA_SKEL="${SCRIPT_DIR}/3-Main-SoC-Realtek-RTL8196E/34-Userdata/skeleton"
+    SKEL_WORK=$(mktemp -d)
+    cp -a "$USERDATA_SKEL/." "$SKEL_WORK/"
+    trap 'rm -rf "$SKEL_WORK"; ssh_cleanup_multiplex' EXIT
+    export SKELETON_DIR="$SKEL_WORK"
+fi
 
 "${SCRIPT_DIR}/build_fullflash.sh" -q
+
+# Read back the IP the user picked (or kept) so the post-install hints
+# show the right address. Fall back to LINUX_IP (upgrade path) or the
+# default for first-time installs that chose DHCP / left the default.
+if [ -z "${IPADDR:-}" ] && [ -f "${SKELETON_DIR}/etc/eth0.conf" ]; then
+    IPADDR=$(awk -F= '$1=="IPADDR"{print $2; exit}' "${SKELETON_DIR}/etc/eth0.conf" 2>/dev/null || true)
+fi
+GW_HINT_IP="${LINUX_IP:-${IPADDR:-192.168.1.88}}"
 
 FULLFLASH="${SCRIPT_DIR}/fullflash.bin"
 if [ ! -f "$FULLFLASH" ]; then
@@ -523,7 +558,7 @@ if [ "$BOOTLOADER_TYPE" = "v2" ]; then
         echo "========================================="
         echo ""
         echo "Flash write succeeded. The gateway will reboot automatically."
-        echo "SSH: root@${LINUX_IP:-${IPADDR:-192.168.1.88}}:22 (no password) in ~30 seconds."
+        echo "SSH: root@${GW_HINT_IP}:22 (no password) in ~30 seconds."
     else
         # Auto-flash failed or no notification — fallback to manual FLW.
         # This path requires an interactive terminal for serial console guidance.
@@ -554,7 +589,7 @@ if [ "$BOOTLOADER_TYPE" = "v2" ]; then
         echo "  INSTALLATION COMPLETE"
         echo "========================================="
         echo ""
-        echo "SSH: root@${LINUX_IP:-${IPADDR:-192.168.1.88}}:22 (no password) in ~30 seconds."
+        echo "SSH: root@${GW_HINT_IP}:22 (no password) in ~30 seconds."
     fi
 
 else
@@ -598,7 +633,7 @@ else
     echo "  INSTALLATION COMPLETE"
     echo "========================================="
     echo ""
-    echo "SSH: root@${LINUX_IP:-${IPADDR:-192.168.1.88}}:22 (no password) in ~30 seconds."
+    echo "SSH: root@${GW_HINT_IP}:22 (no password) in ~30 seconds."
 fi
 
 # --- Restore skeleton if we injected gateway config -------------------------
@@ -621,11 +656,13 @@ if [ "${CONFIRM:-}" != "y" ] && [ -t 0 ]; then
     echo ""
     if [ "$RADIO" = "thread" ]; then
         echo "  ot-rcp.gbl             — OpenThread RCP (required for OTBR)"
+        echo ""
+        echo "Flash with:  ./flash_efr32.sh -g ${GW_HINT_IP} otrcp"
     else
         echo "  ncp-uart-hw-7.5.1.gbl  — Zigbee NCP for in-kernel UART bridge + Z2M"
         echo "  rcp-uart-802154.gbl    — Zigbee RCP for cpcd + zigbeed (Docker)"
         echo "  z3-router-7.5.1.gbl    — Zigbee 3.0 Router (standalone, no coordinator)"
+        echo ""
+        echo "Flash with:  ./flash_efr32.sh -g ${GW_HINT_IP} ncp   (or rcp / router)"
     fi
-    echo ""
-    echo "Flash with:  ./flash_efr32.sh ${LINUX_IP:-${IPADDR:-192.168.1.88}}"
 fi

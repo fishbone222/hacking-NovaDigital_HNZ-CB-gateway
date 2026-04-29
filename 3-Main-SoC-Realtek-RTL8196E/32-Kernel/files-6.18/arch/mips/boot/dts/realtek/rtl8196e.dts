@@ -21,8 +21,8 @@
 		#size-cells = <1>;
 		ranges;
 
-		boothold@3ff000 {
-			reg = <0x003FF000 0x1000>;  /* 4KB reserved for boothold flag */
+		boothold@1ffe000 {
+			reg = <0x01FFE000 0x1000>;  /* 4KB reserved for boothold flag (high DRAM, just below btcode stack) */
 			no-map;
 		};
 	};

@@ -29,6 +29,22 @@ ______________________________________________________________________
 - A Lidl Silvercrest Zigbee Gateway
 - USB-to-serial adapter (3.3V, 38400 8N1) — for the initial flash only
 - Ethernet connection to the gateway
+- **SSH access to the gateway** (only for upgrades and `flash_efr32.sh`):
+  - **SSH key** (recommended): copy your public key once with
+    `ssh-copy-id root@<GATEWAY_IP>` and every script call after that runs
+    silently.
+  - **Encrypted key** without `ssh-agent`, or **root password** only: works
+    too. The first SSH call in each script prompts you once
+    (passphrase or password); subsequent commands ride the same multiplexed
+    channel — no re-prompting.
+  - **Non-interactive (CI / automation) with password only**: set
+    `SSH_PASSWORD=<root password>` in the environment. The scripts use
+    `sshpass` to feed the password to the first ssh call (so install
+    `sshpass` in that case: `sudo apt install sshpass`); subsequent calls
+    ride the multiplexed channel, no further input needed.
+
+  The default password on a fresh install is `root` — change it as soon as
+  the gateway boots. `S90checkpasswd` will warn at every login until you do.
 
 ### Step 1: Clone and Flash the Linux System
 

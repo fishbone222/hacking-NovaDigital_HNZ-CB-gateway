@@ -9,17 +9,40 @@
 # the gateway reboots" failure mode observed during v3.1 testing, plus a
 # retry-on-transport-failure helper. Intentionally not executable; this
 # file is only meant to be sourced.
+#
+# Multiplexing: a per-script ControlMaster socket is created in a private
+# tmpdir, so each script's N back-to-back SSH calls share one TCP/SSH
+# session. Two practical wins:
+#   - Password / passphrase prompted at most once per script run
+#     (subsequent commands ride the existing channel — no re-auth).
+#   - One TCP+SSH handshake instead of N (~500 ms-2 s saved on slow links).
+# Callers MUST chain ssh_cleanup_multiplex into their EXIT trap.
+
+# Per-script private tmpdir for the ControlMaster socket. Using $$ keeps
+# concurrent script runs to the same gateway from sharing a master (each
+# gets its own master, both finish independently).
+SSH_CTRL_DIR="${TMPDIR:-/tmp}/.flash-ssh-cm-${UID}-$$"
+mkdir -p "$SSH_CTRL_DIR"
+chmod 700 "$SSH_CTRL_DIR"
 
 # Hardened SSH options (bash array — splice into ssh invocation).
 # Callers add their own scenario-specific options on top:
 #   - StrictHostKeyChecking policy (post-install: accept-new; first-flash: no)
-#   - ControlMaster / ControlPath / ControlPersist (multiplexed sessions)
 #   - port, identity file, etc.
+#
+# Note: BatchMode=yes is intentionally NOT set. With BatchMode, ssh
+# silently fails on encrypted private keys not loaded in ssh-agent
+# (issue #90) and refuses password prompts entirely — leaving users
+# without a key with no path forward. ConnectTimeout + ServerAlive
+# already cover the original "ssh hangs forever" concern (transport
+# layer); auth-time prompts are the user's call.
 SSH_HARDEN_OPTS=(
     -o ConnectTimeout=5
     -o ServerAliveInterval=3
     -o ServerAliveCountMax=2
-    -o BatchMode=yes
+    -o ControlMaster=auto
+    -o "ControlPath=${SSH_CTRL_DIR}/sock-%C"
+    -o ControlPersist=60s
 )
 
 # ssh_retry: ssh wrapper that retries on transport failures only (rc=255).
@@ -64,4 +87,43 @@ wait_for_port() {
         sleep 0.5
     done
     return 1
+}
+
+# ssh_cleanup_multiplex: tell every live ControlMaster to exit, then drop
+# the tmpdir. Idempotent and silent on failure (best-effort cleanup).
+# Callers MUST invoke this at script end — typically chained into their
+# existing EXIT trap, e.g.:
+#
+#     trap 'rm -rf "$WORK_DIR"; ssh_cleanup_multiplex' EXIT
+#
+# Safe to call when no master was ever started — nothing to do, no error.
+ssh_cleanup_multiplex() {
+    local sock
+    [ -d "$SSH_CTRL_DIR" ] || return 0
+    for sock in "$SSH_CTRL_DIR"/sock-*; do
+        [ -S "$sock" ] || continue
+        ssh -o "ControlPath=$sock" -O exit _ 2>/dev/null || true
+    done
+    rm -rf "$SSH_CTRL_DIR" 2>/dev/null || true
+}
+
+# ssh_prime_with_password: open the ControlMaster session non-interactively
+# using the password in $SSH_PASSWORD. No-op when SSH_PASSWORD is unset
+# (interactive runs use ssh's built-in tty prompt instead). Errors out if
+# SSH_PASSWORD is set but sshpass is not installed.
+#
+# Usage: ssh_prime_with_password [extra-ssh-opts...] target
+#
+# Pass the same opts the caller will use for subsequent ssh_retry calls
+# (StrictHostKeyChecking policy, port, etc.) so the master's options match.
+# After this returns 0, plain `ssh` / `ssh_retry` to the same target reuses
+# the open master without re-auth.
+ssh_prime_with_password() {
+    [ -z "${SSH_PASSWORD:-}" ] && return 0
+    if ! command -v sshpass >/dev/null 2>&1; then
+        echo "Error: SSH_PASSWORD is set but sshpass is not installed." >&2
+        echo "Install with:  sudo apt install sshpass" >&2
+        return 1
+    fi
+    SSHPASS="$SSH_PASSWORD" sshpass -e ssh "$@" "true" 2>/dev/null
 }

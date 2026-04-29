@@ -20,6 +20,21 @@
 #   - Short presses (< 5 s) are ignored — leaves room for future bindings
 #     (e.g. factory reset, pairing trigger) without retraining users.
 #
+# Spurious-trigger hardening (v3.2.0+):
+#   1. Edge detection — require an observed HIGH→LOW transition before
+#      counting.  If GPIO 9 is LOW at boot and never goes HIGH (stuck
+#      hardware, wrong pin mux at startup), the detector stays disarmed
+#      and recover_efr32 never fires.
+#   2. Debounce — require 3 consecutive LOW polls (~300 ms) before
+#      treating it as a real press.  Filters single-sample noise.
+#   3. Mux re-verification — before counting, re-read CNR.  If GPIO 9
+#      was flipped back to peripheral mode by something else at runtime,
+#      DATA reflects the peripheral output, not the button.  Restore
+#      GPIO mode, log it, and require re-arming via HIGH.
+#   4. Logging — every state transition (armed, press, release, mux
+#      flip, long-press fire) is logged via `logger -t S40button` for
+#      post-mortem diagnostics.
+#
 # See 2-Zigbee-Radio-Silabs-EFR32/POST-MORTEM-bootloader-recovery.md.
 
 GPIO_BASE=0x18003500
@@ -31,7 +46,7 @@ BUTTON_MASK=$((1 << BUTTON_BIT))
 
 LED_PATH=/sys/class/leds/status/brightness
 LONG_PRESS_S=5
-POLL_MS=100
+DEBOUNCE_SAMPLES=3   # 3 × 100 ms = 300 ms confirmed-LOW window
 PIDFILE=/var/run/S40button.pid
 
 configure_gpio() {
@@ -59,46 +74,104 @@ button_pressed() {
     [ $((d & BUTTON_MASK)) -eq 0 ]
 }
 
+gpio_in_peripheral_mode() {
+    # CNR bit 9 == 1 means GPIO 9 is muxed to a peripheral, not GPIO input.
+    cnr=$(devmem $CNR 32)
+    [ $((cnr & BUTTON_MASK)) -ne 0 ]
+}
+
 # The poll loop. Runs forever in background as PID stored in PIDFILE.
 poll_loop() {
     saved_led=$(led_save)
+    armed=0   # 1 once we've observed a HIGH on GPIO 9 → ready to detect a press
+
     while :; do
-        if button_pressed; then
-            held_ms=0
-            # Subtle blink: alternate between current brightness and dim
-            blink_state=0
-            while button_pressed; do
-                # Toggle LED every ~500 ms while held, for visual feedback
-                if [ $((held_ms % 500)) -eq 0 ]; then
-                    if [ $blink_state -eq 0 ]; then
-                        led_set 30
-                        blink_state=1
-                    else
-                        led_set 255
-                        blink_state=0
-                    fi
-                fi
-                # Trigger at LONG_PRESS_S
-                if [ $held_ms -ge $((LONG_PRESS_S * 1000)) ]; then
-                    led_set 0
-                    sleep 0.2
-                    led_set 255
-                    logger -t S40button "long-press detected, invoking recover_efr32"
-                    /usr/sbin/recover_efr32 -q
-                    # Wait for release before re-arming, so a continued
-                    # press doesn't fire repeatedly.
-                    while button_pressed; do
-                        sleep 0.2
-                    done
-                    break
-                fi
-                sleep 0.1
-                held_ms=$((held_ms + 100))
-            done
-            # Restore LED to its prior state on release
-            [ -n "$saved_led" ] && led_set "$saved_led"
+        if ! button_pressed; then
+            # Line is HIGH (idle / released).
+            if [ $armed -eq 0 ]; then
+                logger -t S40button "GPIO 9 idle (HIGH), press detector armed"
+                armed=1
+            fi
+            sleep 0.1
+            continue
         fi
-        sleep 0.1
+
+        # Line is LOW.
+        if [ $armed -eq 0 ]; then
+            # Never observed HIGH since boot/last mux flip — refuse to trigger.
+            # This guards against a stuck-low pin or wrong mux at startup.
+            sleep 0.1
+            continue
+        fi
+
+        # Defensive: re-verify GPIO mode before treating LOW as a real press.
+        # If something flipped GPIO 9 back to peripheral mode at runtime,
+        # DATA bit reflects the peripheral, not the button.
+        if gpio_in_peripheral_mode; then
+            logger -t S40button "GPIO 9 reverted to peripheral mode (CNR=$cnr) — restoring + disarming"
+            configure_gpio
+            armed=0
+            sleep 0.2
+            continue
+        fi
+
+        # Debounce: require DEBOUNCE_SAMPLES consecutive LOW polls.
+        debounce=1
+        while [ $debounce -lt $DEBOUNCE_SAMPLES ]; do
+            sleep 0.1
+            if button_pressed; then
+                debounce=$((debounce + 1))
+            else
+                debounce=0
+                break
+            fi
+        done
+        [ $debounce -lt $DEBOUNCE_SAMPLES ] && continue
+
+        # Confirmed press.
+        logger -t S40button "press detected, watching for ${LONG_PRESS_S}s long-press"
+        held_ms=$((DEBOUNCE_SAMPLES * 100))   # already counted during debounce
+        blink_state=0
+        fired=0
+
+        while button_pressed; do
+            # Subtle blink every 500 ms for visual feedback.
+            if [ $((held_ms % 500)) -eq 0 ]; then
+                if [ $blink_state -eq 0 ]; then
+                    led_set 30
+                    blink_state=1
+                else
+                    led_set 255
+                    blink_state=0
+                fi
+            fi
+            # Long-press threshold reached?
+            if [ $held_ms -ge $((LONG_PRESS_S * 1000)) ]; then
+                led_set 0
+                sleep 0.2
+                led_set 255
+                logger -t S40button "long-press detected, invoking recover_efr32"
+                /usr/sbin/recover_efr32 -q
+                fired=1
+                # Wait for release before re-arming, so a continued press
+                # doesn't fire repeatedly.
+                while button_pressed; do
+                    sleep 0.2
+                done
+                armed=0   # require seeing HIGH again before next detection
+                break
+            fi
+            sleep 0.1
+            held_ms=$((held_ms + 100))
+        done
+
+        # If we exited the inner loop without firing, it was a short press.
+        if [ $fired -eq 0 ]; then
+            logger -t S40button "press released after ${held_ms}ms (short-press, ignored)"
+        fi
+
+        # Restore LED to its prior state.
+        [ -n "$saved_led" ] && led_set "$saved_led"
     done
 }
 

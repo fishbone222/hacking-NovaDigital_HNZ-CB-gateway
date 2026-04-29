@@ -79,7 +79,17 @@ Options:
                      (useful for chaining multiple invocations)
   -h, --help         Show this help and exit
 
-Environment variables (deprecated, prefer flags):
+Environment variables:
+  SSH_PASSWORD   Root password for non-interactive password auth (CI / no
+                 tty). When set, the first ssh call is fed via sshpass and
+                 the ControlMaster takes over for the rest. Requires
+                 sshpass (sudo apt install sshpass).
+  USF_ALLOW_SYSTEM=1
+                 Use a system-installed universal-silabs-flasher instead of
+                 the pinned venv (default: ignore system, install venv).
+                 Probe results may differ — see issue #92.
+
+Legacy environment variables (deprecated, prefer flags):
   FW_CHOICE   1..5 (legacy v3.0.x interface)
   BAUD_CHOICE baud value
   CONFIRM     set to "y" to skip prompt
@@ -91,6 +101,7 @@ Examples:
   flash_efr32.sh -y -g 10.0.0.5 otrcp           # OT-RCP on a custom IP
   flash_efr32.sh -y --no-reboot bootloader && \
     flash_efr32.sh -y ncp                       # Two-step bootloader+app
+  SSH_PASSWORD=root flash_efr32.sh -y ncp       # Non-interactive password
 USAGE
 }
 
@@ -193,6 +204,11 @@ fi
 if ! python3 -c "import venv" 2>/dev/null; then
     echo "Error: python3-venv not found." >&2
     echo "Install it with: sudo apt install python3-venv" >&2
+    exit 1
+fi
+if [ -n "${SSH_PASSWORD:-}" ] && ! command -v sshpass >/dev/null 2>&1; then
+    echo "Error: SSH_PASSWORD is set but sshpass is not installed." >&2
+    echo "Install it with: sudo apt install sshpass" >&2
     exit 1
 fi
 
@@ -362,11 +378,20 @@ echo "Gateway:  ${GW_IP}:${GW_PORT}"
 echo ""
 
 # --- 1. Check / install universal-silabs-flasher ---------------------------
+#
+# Always use the pinned venv install (USF 1.0.3 + our probe-methods patch).
+# A system-wide universal-silabs-flasher in $PATH is intentionally ignored:
+# older releases use `--probe-method` (singular, no comma-list) instead of
+# `--probe-methods`, and none of them carry our DEFAULT_PROBE_METHODS
+# extension (extra bauds for EZSP/SPINEL/CPC). Issue #92.
+#
+# Operators who really want to use a system USF can set USF_ALLOW_SYSTEM=1,
+# but the bauds and CLI must match the pinned version or probe will fail.
 
 PATCH_FILE="$SCRIPT_DIR/silabs-flasher-probe-methods.patch"
 PATCH_HASH_FILE="${VENV_DIR}/.patch-hash"
 
-# Reinstall if probe-methods patch has changed since last install
+# Reinstall if the probe-methods patch has changed since last install.
 if [ -x "${VENV_DIR}/bin/universal-silabs-flasher" ] && [ -f "$PATCH_FILE" ]; then
     current_hash=$(md5sum "$PATCH_FILE" 2>/dev/null | awk '{print $1}')
     applied_hash=$(cat "$PATCH_HASH_FILE" 2>/dev/null || true)
@@ -376,19 +401,12 @@ if [ -x "${VENV_DIR}/bin/universal-silabs-flasher" ] && [ -f "$PATCH_FILE" ]; th
     fi
 fi
 
-if [ -x "${VENV_DIR}/bin/universal-silabs-flasher" ]; then
-    FLASHER="${VENV_DIR}/bin/universal-silabs-flasher"
-    echo "universal-silabs-flasher: venv (${VENV_DIR})"
-elif command -v universal-silabs-flasher >/dev/null 2>&1; then
-    FLASHER="universal-silabs-flasher"
-    echo "universal-silabs-flasher: $(command -v universal-silabs-flasher)"
-else
-    echo "universal-silabs-flasher not found — installing in ${VENV_DIR}..."
+install_usf_venv() {
+    echo "Installing universal-silabs-flasher 1.0.3 in ${VENV_DIR}..."
     python3 -m venv "$VENV_DIR"
     "${VENV_DIR}/bin/pip" install --quiet universal-silabs-flasher==1.0.3
-    FLASHER="${VENV_DIR}/bin/universal-silabs-flasher"
-    # Patch USF to probe Spinel/EZSP at 115200/230400 (upstream only probes
-    # Spinel at 460800 and EZSP at 115200/460800 — misses our common bauds)
+    # Patch USF to probe Spinel/EZSP/CPC at extra bauds (upstream's
+    # DEFAULT_PROBE_METHODS misses 230400, 691200, 892857 etc.)
     USF_CONST=$(find "$VENV_DIR" -path '*/universal_silabs_flasher/const.py' -print -quit)
     if [ -n "$USF_CONST" ] && [ -f "$PATCH_FILE" ] && \
        patch --dry-run -f "$USF_CONST" "$PATCH_FILE" >/dev/null 2>&1; then
@@ -396,8 +414,20 @@ else
         md5sum "$PATCH_FILE" | awk '{print $1}' > "$PATCH_HASH_FILE"
         echo "Installed (patched probe methods)."
     else
-        echo "Installed."
+        echo "Installed (no patch applied — file or patch missing)."
     fi
+}
+
+if [ "${USF_ALLOW_SYSTEM:-0}" = "1" ] && command -v universal-silabs-flasher >/dev/null 2>&1; then
+    FLASHER="$(command -v universal-silabs-flasher)"
+    echo "universal-silabs-flasher: ${FLASHER} (system, USF_ALLOW_SYSTEM=1)"
+    echo "Note: probe results may differ from the pinned 1.0.3 install — see #92."
+else
+    if [ ! -x "${VENV_DIR}/bin/universal-silabs-flasher" ]; then
+        install_usf_venv
+    fi
+    FLASHER="${VENV_DIR}/bin/universal-silabs-flasher"
+    echo "universal-silabs-flasher: venv (${VENV_DIR})"
 fi
 echo ""
 
@@ -407,6 +437,12 @@ echo ""
 # all operations below.
 
 echo "Connecting to ${GW_IP} — detecting configuration..."
+# Open the ControlMaster up-front using SSH_PASSWORD if provided
+# (no-op when SSH_PASSWORD is unset — ssh's tty prompt handles it).
+if ! ssh_prime_with_password "${SSH_HARDEN_OPTS[@]}" \
+        -o StrictHostKeyChecking=accept-new "root@${GW_IP}"; then
+    exit 1
+fi
 # Remote shell emits structured KEY=VALUE lines (one per line). Local
 # parsing is then trivial via grep, no fragile suffix-matching. Any
 # stderr/non-KEY=VALUE noise from `set -u` etc. is tolerated.
@@ -668,6 +704,7 @@ cleanup() {
         echo "Flash did not complete successfully. To reboot manually:" >&2
         echo "  ssh root@${GW_IP} reboot" >&2
     fi
+    ssh_cleanup_multiplex
 }
 trap cleanup EXIT
 

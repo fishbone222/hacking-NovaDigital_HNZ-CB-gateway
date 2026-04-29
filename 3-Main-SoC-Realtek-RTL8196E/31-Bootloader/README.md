@@ -12,7 +12,7 @@ This is the **last missing piece** that makes the entire gateway firmware stack 
 
 ```
 Realtek RTL8196E  CPU: 400MHz  RAM: 32MB  Flash: GD25Q128
-Bootloader: V2.5 - 2026.03.22 - J. Nilo
+Bootloader: V2.6 - 2026.04.28 - J. Nilo
 ```
 
 **Download progress in %** — The stock bootloader prints endless `.` or `#` characters that flood the serial console during TFTP transfers. This version shows a clean percentage indicator:

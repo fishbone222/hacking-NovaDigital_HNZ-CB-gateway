@@ -1,10 +1,13 @@
 #!/bin/sh
 # build_boothold.sh — Build STATIC boothold binary with Lexra toolchain for RTL8196E
 #
-# boothold: write HOLD magic to DRAM (with cache flush) and reboot into
-# the <RealTek> bootloader prompt.  Replaces the shell script version
-# which used devmem (writes through KSEG0 write-back cache — unreliable,
-# the cache line may not reach DRAM before the watchdog reset).
+# boothold: write HOLD magic to DRAM and exit; the caller (typically a
+# shell `&& reboot`) triggers the watchdog reset.  The bootloader reads
+# the magic on next boot and stops at the <RealTek> prompt.
+#
+# See ../boothold/src/boothold.c for the full mechanism documentation,
+# and ../../31-Bootloader/doc/REBOOT_TO_BOOTLOADER.md for the protocol
+# end-to-end (Linux ↔ DRAM ↔ bootloader).
 #
 # Usage:
 #   ./build_boothold.sh
