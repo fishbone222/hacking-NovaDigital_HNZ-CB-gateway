@@ -93,7 +93,9 @@ nav:
       - 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/README.md
       - EmberZNet 8.x guide: 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/EMBERZNET-8.x-GUIDE.md
       - cpcd: 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/cpcd/README.md
-      - Docker: 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/docker/README.md
+      - Docker:
+        - 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/docker/README.md
+        - cpcd + zigbeed + otbr image: 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/docker/cpcd-zigbeed-otbr/README.md
       - RCP stack: 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/rcp-stack/README.md
       - zigbeed 7.5.1: 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/zigbeed-7.5.1/README.md
       - zigbeed 8.2.2: 2-Zigbee-Radio-Silabs-EFR32/25-RCP-UART-HW/zigbeed-8.2.2/README.md
@@ -102,6 +104,9 @@ nav:
       - Thread & Matter primer: 2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/THREAD-MATTER-PRIMER.md
       - ot-ctl cheat-sheet: 2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/OT-CTL-CHEATSHEET.md
       - Docker: 2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/docker/README.md
+      - Range testing:
+        - 2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/range-testing/README.md
+        - Field-test report: 2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/range-testing/REPORT.md
     - Router: 2-Zigbee-Radio-Silabs-EFR32/27-Router/README.md
   - Main SoC (RTL8196E):
     - 3-Main-SoC-Realtek-RTL8196E/README.md
@@ -111,7 +116,13 @@ nav:
       - Commands: 3-Main-SoC-Realtek-RTL8196E/31-Bootloader/doc/COMMANDS.md
       - Reboot to bootloader: 3-Main-SoC-Realtek-RTL8196E/31-Bootloader/doc/REBOOT_TO_BOOTLOADER.md
       - Testing guide: 3-Main-SoC-Realtek-RTL8196E/31-Bootloader/doc/TESTING.md
-    - Kernel: 3-Main-SoC-Realtek-RTL8196E/32-Kernel/README.md
+    - Kernel:
+      - 3-Main-SoC-Realtek-RTL8196E/32-Kernel/README.md
+      - UART↔TCP bridge:
+        - 3-Main-SoC-Realtek-RTL8196E/32-Kernel/files-6.18/drivers/net/rtl8196e-uart-bridge/README.md
+        - Security: 3-Main-SoC-Realtek-RTL8196E/32-Kernel/files-6.18/drivers/net/rtl8196e-uart-bridge/SECURITY.md
+      - Watchdog driver: 3-Main-SoC-Realtek-RTL8196E/32-Kernel/files-6.18/drivers/watchdog/README.md
+      - Ethernet driver performance: 3-Main-SoC-Realtek-RTL8196E/32-Kernel/files-6.18/drivers/net/ethernet/rtl8196e-eth/PERFORMANCE.md
     - Rootfs: 3-Main-SoC-Realtek-RTL8196E/33-Rootfs/README.md
     - Userdata:
       - 3-Main-SoC-Realtek-RTL8196E/34-Userdata/README.md
