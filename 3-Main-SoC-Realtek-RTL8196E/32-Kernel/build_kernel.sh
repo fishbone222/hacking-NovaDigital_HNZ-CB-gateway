@@ -66,6 +66,9 @@ if [ -z "$CVIMG" ]; then
             exit 1
         fi
         echo "cvimg not found — building it..."
+        # Clear a dangling symlink left by the Docker entrypoint when reusing the
+        # same workspace from the host (target /home/builder/... only exists in-container).
+        [ -L "${BUILD_ENV}/bin" ] && [ ! -d "${BUILD_ENV}/bin" ] && rm -f "${BUILD_ENV}/bin"
         mkdir -p "${BUILD_ENV}/bin"
         if gcc -std=c99 -Wall -O2 -D_GNU_SOURCE -o "${BUILD_ENV}/bin/cvimg" "$CVIMG_SRC"; then
             CVIMG="${BUILD_ENV}/bin/cvimg"

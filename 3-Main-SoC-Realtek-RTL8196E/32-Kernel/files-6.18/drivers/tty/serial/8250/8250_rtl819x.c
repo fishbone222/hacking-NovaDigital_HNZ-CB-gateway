@@ -32,7 +32,7 @@
 #include "8250.h"
 
 #define DRV_NAME    "rtl8196e-uart"
-#define DRV_VERSION "1.0"
+#define DRV_VERSION "1.1"
 
 /*
  * RTL8196E UART Flow Control Register
@@ -56,6 +56,15 @@
  */
 #define RTL8196E_UART_FLOW_CTRL_OFFSET		0x10	/* reg 4 (MCR) << regshift=2 */
 #define RTL8196E_UART_FLOW_CTRL_BIT		BIT(29)
+
+/*
+ * Full MCR pattern enforced when CRTSCTS is active: DTR|RTS|OUT2|AFE,
+ * shifted into bits 24..31 by the SoC's byte-lane routing (see comment
+ * above). This is the boot-time value 0x2B000000 documented at the top
+ * of the file; we re-enforce it on every enable_flow_control() call.
+ */
+#define RTL8196E_UART_MCR_PATTERN	\
+	(((u32)(UART_MCR_DTR | UART_MCR_RTS | UART_MCR_OUT2 | UART_MCR_AFE)) << 24)
 
 /*
  * PIN_MUX_SEL register (offset 0x40 in system controller).
@@ -123,26 +132,30 @@ static void rtl8196e_uart_enable_flow_control(struct uart_port *port,
 	 * no concurrency exists. Skip lock acquisition in that case. */
 	if (port)
 		uart_port_lock_irqsave(port, &flags);
+	/*
+	 * Force the full MCR pattern (DTR|RTS|OUT2|AFE) on every call: the
+	 * 8250 core's byte-wise MCR writes during set_termios preserve AFE
+	 * but stomp DTR/RTS/OUT2 to its mctrl shadow, leaving the SoC at
+	 * MCR=0x20000000 (AFE only). With RTS clear under AFE the SoC
+	 * asserts !RTS to the EFR32 → RCP Spinel responses throttle →
+	 * otbr-agent times out. The earlier "skip if AFE already set"
+	 * fast-path masked this — we must re-OR every time.
+	 */
 	reg_val = readl(data->flow_ctrl_base);
-	if (reg_val & RTL8196E_UART_FLOW_CTRL_BIT) {
-		if (port)
-			uart_port_unlock_irqrestore(port, flags);
-		dev_dbg(data->dev, "HW flow control already enabled (0x%08x)\n",
-			reg_val);
-		return;
-	}
-	reg_val |= RTL8196E_UART_FLOW_CTRL_BIT;
+	reg_val |= RTL8196E_UART_MCR_PATTERN;
 	writel(reg_val, data->flow_ctrl_base);
 	/* Read back under lock to verify atomically */
 	reg_val = readl(data->flow_ctrl_base);
 	if (port)
 		uart_port_unlock_irqrestore(port, flags);
 
-	if (reg_val & RTL8196E_UART_FLOW_CTRL_BIT) {
-		dev_dbg(data->dev, "HW flow control enabled (reg=0x%08x)\n",
+	if ((reg_val & RTL8196E_UART_MCR_PATTERN) == RTL8196E_UART_MCR_PATTERN) {
+		dev_dbg(data->dev, "HW flow control enforced (reg=0x%08x)\n",
 			reg_val);
 	} else {
-		dev_err(data->dev, "Failed to enable HW flow control!\n");
+		dev_err(data->dev,
+			"MCR pattern incomplete: 0x%08x (want 0x%08x set)\n",
+			reg_val, RTL8196E_UART_MCR_PATTERN);
 	}
 }
 

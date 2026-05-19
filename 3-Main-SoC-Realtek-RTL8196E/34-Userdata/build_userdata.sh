@@ -127,6 +127,9 @@ if [ "$BUILD_IMAGE" -eq 1 ]; then
             echo "Error: cvimg source not found at ${CVIMG_SRC}" >&2
             exit 1
         fi
+        # Clear a dangling symlink left by the Docker entrypoint when reusing the
+        # same workspace from the host (target /home/builder/... only exists in-container).
+        [ -L "${BUILD_ENV}/bin" ] && [ ! -d "${BUILD_ENV}/bin" ] && rm -f "${BUILD_ENV}/bin"
         mkdir -p "${BUILD_ENV}/bin"
         gcc -std=c99 -Wall -O2 -D_GNU_SOURCE -o "$CVIMG_TOOL" "$CVIMG_SRC" || {
             echo "Error: failed to compile cvimg" >&2

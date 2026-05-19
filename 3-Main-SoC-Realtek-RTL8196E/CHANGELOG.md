@@ -6,6 +6,34 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.5.1] - 2026-05-19
+
+Single-fix patch release: closes a partial MCR clobber in the RTL8196E
+UART driver that could throttle the RCP Spinel link between the kernel
+and the EFR32 radio after a `CRTSCTS` termios cycle, eventually causing
+`otbr-agent` to time out with `RadioSpinelNoResponse`.
+
+### Kernel — UART driver (`8250_rtl819x` v1.1)
+
+`rtl8196e_uart_enable_flow_control()` no longer fast-paths when the AFE
+bit (bit 29) is already set in MCR. The 8250 core's byte-wise MCR writes
+during `set_termios()` preserve AFE but stomp DTR/RTS/OUT2 back to its
+mctrl shadow. With the previous fast-path, the post-termios re-enable
+saw AFE=1 and returned, leaving the SoC at `MCR = 0x20000000` (AFE only)
+instead of the boot-time `0x2B000000` (DTR|RTS|OUT2|AFE). RTS clear
+under AFE = SoC asserts !RTS to the EFR32 = Spinel throttle = RCP
+timeout.
+
+The fix re-ORs the full `DTR|RTS|OUT2|AFE` pattern on every call, so the
+post-termios re-enable always restores the boot-time MCR even when AFE
+is already set. Observable signal: `devmem 0x18002110 32` reads
+`0x2B000000` after every `S70otbr restart`; symptomatic gateways read
+`0x20000000`.
+
+Driver `MODULE_VERSION` bumped 1.0 → 1.1.
+
+---
+
 ## [3.5.0] - 2026-05-17
 
 Two robustness improvements aimed at the same failure mode — the
