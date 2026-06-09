@@ -16,7 +16,7 @@
 #   piggy.elf  ->  piggy.bin  (raw stage-2 payload)
 #     |  embed in start.o via .initrd section
 #     v
-#   start.o  +  start_c.o
+#   start.o
 #     |  link with ld.script
 #     v
 #   boot.elf  ->  boot  (raw binary)
@@ -99,10 +99,7 @@ $(OUTDIR)/start.o: start.S $(OUTDIR)/piggy.bin | $(OUTDIR)
 	$(CC) $(CFLAGS) -I../boot/include -O2 -c start.S -o $@
 	$(OBJCOPY) --add-section .initrd=$(OUTDIR)/piggy.bin $@
 
-$(OUTDIR)/start_c.o: start_c.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -nostdinc -c $< -o $@
-
-$(OUTDIR)/boot.elf: $(OUTDIR)/start.o $(OUTDIR)/start_c.o
+$(OUTDIR)/boot.elf: $(OUTDIR)/start.o
 	$(LD) -X -nostdlib -Tld.script $< -o $@
 
 $(OUTDIR)/boot: $(OUTDIR)/boot.elf

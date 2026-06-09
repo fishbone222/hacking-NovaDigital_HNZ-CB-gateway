@@ -13,8 +13,7 @@ Used on routers/gateways with SPI flash and SDRAM.
 
 ```
 ├── btcode/          # Stage 1: Initial boot code (LZMA wrapper)
-│   ├── start.S      # MIPS assembly entry point
-│   ├── start_c.c    # C-level UART I/O and keyboard detection
+│   ├── start.S      # MIPS assembly entry point (DDR init + payload copy)
 │   ├── piggy.S      # Compressed payload wrapper
 │   ├── bootload.c   # LZMA decompression and jump to stage 2
 │   └── LzmaDecode.* # LZMA decompressor
@@ -241,7 +240,7 @@ boot.img.gz  +  piggy.S  +  bootload.o  +  LzmaDecode.o
 piggy.elf  ->  piggy.bin  (raw stage-2 payload)
   |  embed in start.o via .initrd section
   v
-start.o  +  start_c.o
+start.o
   |  link with ld.script
   v
 boot.elf  ->  boot  (raw binary)

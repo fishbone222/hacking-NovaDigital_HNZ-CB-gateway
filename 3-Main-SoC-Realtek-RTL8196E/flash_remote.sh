@@ -64,8 +64,8 @@ usage() {
     echo ""
     echo "Options:"
     echo "  -y, --yes        Non-interactive mode (skip all prompts)"
-    echo "  --boot-ip <IP>   Bootloader-mode / TFTP server IP (overrides BOOT_IP env;"
-    echo "                   default: 192.168.1.6)"
+    echo "  --boot-ip <IP|host>  Bootloader-mode / TFTP server IP (overrides BOOT_IP"
+    echo "                   env; default: 192.168.1.6). A hostname is resolved host-side."
     echo ""
     echo "Environment: BOOT_IP (default: 192.168.1.6), SSH_TIMEOUT,"
     echo "  SSH_PASSWORD (sshpass), NET_MODE, RADIO_MODE, CONFIRM"
@@ -97,10 +97,16 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# Apply --boot-ip override (flag > env > default) and validate.
+# Apply --boot-ip override (flag > env > default), resolving a hostname if one
+# was given (the on-device boothold/bootloader need a literal IPv4 — resolve
+# host-side). A dotted-quad passes through unchanged.
 [ -n "$BOOT_IP_FLAG" ] && BOOT_IP="$BOOT_IP_FLAG"
-if ! valid_ipv4 "$BOOT_IP"; then
-    echo "Error: invalid BOOT_IP '$BOOT_IP' (expected dotted-quad IPv4)." >&2
+if BOOT_IP_RESOLVED="$(resolve_ipv4 "$BOOT_IP")"; then
+    [ "$BOOT_IP_RESOLVED" != "$BOOT_IP" ] && echo "Resolved BOOT_IP '$BOOT_IP' -> $BOOT_IP_RESOLVED"
+    BOOT_IP="$BOOT_IP_RESOLVED"
+else
+    echo "Error: invalid BOOT_IP '$BOOT_IP' (not a dotted-quad IPv4, and could" >&2
+    echo "not be resolved as a hostname)." >&2
     exit 1
 fi
 

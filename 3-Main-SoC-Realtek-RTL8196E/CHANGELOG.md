@@ -6,6 +6,71 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.8.2] - 2026-06-09
+
+_Host-side flashing-tooling and UX release. No on-device firmware behavior
+change — the kernel and bootloader binaries are identical to v3.8.1; only the
+flashing scripts and the version banner differ._
+
+### `flash_install_rtl8196e.sh` — build the image before boothold on the upgrade path
+
+On the auto (boothold) upgrade path the 16 MiB `fullflash.bin` was assembled
+only *after* the gateway had warm-rebooted into the bootloader, so on slow
+hosts (e.g. a Raspberry Pi 4) the gateway sat idle in download mode for the
+whole multi-minute build. The image depends only on the config snapshotted
+over SSH into `SKELETON_DIR` *before* boothold — no bootloader state — so the
+build can run while Linux is still up.
+
+The build + size check + final WARNING/Proceed confirmation are factored into
+`build_image_and_confirm()` (guarded by `IMAGE_READY`). On the auto path it is
+called right after `require_boot_l2` and **before** boothold; at the
+convergence point it runs only if not already done, so the first-flash /
+manual path (gateway already in the bootloader, interactive IP/radio prompts)
+is unchanged.
+
+* **Auto path:** only the TFTP upload + flash write now block the gateway, not
+  the build.
+* **Safer abort:** declining the confirmation (or a build failure) leaves Linux
+  intact instead of stranding the gateway in the bootloader.
+* **First-flash / Tuya / manual paths:** behaviour identical.
+* **ICMP capability probe now polls (~10 s) instead of a single ping.** With the
+  build no longer sitting between bootloader detection and the probe, the custom
+  V2.5 bootloader's ICMP responder may not be up yet for the first second or two;
+  a single ping flaked to "no auto-flash" and printed manual FLW guidance even
+  though the auto-flash succeeded. A genuine Tuya / pre-v2 bootloader still never
+  answers and correctly falls through to the manual path.
+
+* `flash_install_rtl8196e.sh` — new `build_image_and_confirm()` helper; build
+  relocated ahead of boothold on the upgrade path; pre-upload ICMP probe polls
+  for the bootloader to settle.
+
+### `flash_install_rtl8196e.sh` — clearer guidance when auto-flash is not detected
+
+When the script falls back to the manual-FLW path (e.g. the ICMP probe never
+classified the bootloader as auto-flashing), a custom V2.x bootloader may still
+have auto-flashed the uploaded image on its own. The fallback wording now says
+so explicitly and tells the user to `ping`/`ssh` the gateway (waiting ~2 min for
+the reboot) **before** re-flashing — instead of the previous, misleading
+"nothing was changed", which contradicted a flash that had in fact succeeded.
+
+* `flash_install_rtl8196e.sh` — `manual_flw_guidance()` adds an auto-flash
+  heads-up before the FLW steps and a check-first message after a declined
+  confirmation. Behaviour is unchanged; only the on-screen guidance differs.
+
+### `--boot-ip` / `BOOT_IP` accept a hostname
+
+The bootloader-mode IP can now be given as a hostname; it is resolved host-side
+to a dotted-quad before use (the on-device `boothold` and the bootloader only
+understand a literal IPv4). A dotted-quad still passes through unchanged.
+
+* `lib/ssh.sh` — new `resolve_ipv4()` (passthrough for a valid IPv4, otherwise
+  `getent ahostsv4` + re-validate).
+* `flash_install_rtl8196e.sh`, `flash_remote.sh` — `--boot-ip` / `BOOT_IP` run
+  through `resolve_ipv4()`; an error is printed if the value is neither a valid
+  IPv4 nor a name that resolves to one.
+
+---
+
 ## [3.8.1] - 2026-06-09
 
 ### Kernel — Hardware watchdog (`rtl819x_wdt` 1.2 → 1.3) — panic notifier ordering hardened

@@ -143,3 +143,24 @@ valid_ipv4() {
     done
     [ "$count" -eq 4 ]
 }
+
+# resolve_ipv4 — echo a dotted-quad IPv4 for $1, resolving a hostname if needed.
+# If $1 is already a valid IPv4 it is echoed unchanged; otherwise it is treated
+# as a hostname and resolved host-side via getent (the on-device boothold and the
+# bootloader cannot resolve names — boothold parses sscanf("%d.%d.%d.%d") and the
+# host-side ip route / ip neigh / tftp / ping all need a literal, so resolution
+# must happen here). Returns 1 (echoing nothing) if $1 is neither a valid IPv4
+# nor a name that resolves to one.
+resolve_ipv4() {
+    if valid_ipv4 "$1"; then
+        printf '%s\n' "$1"
+        return 0
+    fi
+    local ip
+    ip=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}')
+    if [ -n "$ip" ] && valid_ipv4 "$ip"; then
+        printf '%s\n' "$ip"
+        return 0
+    fi
+    return 1
+}

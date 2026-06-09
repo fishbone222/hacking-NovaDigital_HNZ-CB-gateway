@@ -57,7 +57,7 @@ lab_uart_show:
 	/* DDR and clock configuration */
 	REG32_W(DDCR_REG, DDCR_INIT_VAL)	/* DDR calibration register init */
 	nop
-	REG32_W(CLKMGR_REG, CLKMGR_DEFAULT)	/* Clock manager, value from start_c.c */
+	REG32_W(CLKMGR_REG, CLKMGR_DEFAULT)	/* Clock manager, value from start.h */
 	nop
 
 	/* Check system status and configure for DDR1 if needed */

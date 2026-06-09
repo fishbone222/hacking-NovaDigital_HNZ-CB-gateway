@@ -25,8 +25,12 @@ OBJDUMP  = $(CROSS)objdump
 OUTDIR   = build
 
 # --- Build timestamp -------------------------------------------------------
+# Pinned build timestamp of this bootloader version (NOT a live `date` call),
+# so the build is reproducible: same source => same boot.bin. This is the
+# actual build moment of the current B_VERSION; update it together with
+# B_VERSION (include/ver.h) whenever the bootloader is rebuilt for a release.
 
-BOOT_CODE_TIME ?= $(shell date "+%Y.%m.%d-%H:%M%z")
+BOOT_CODE_TIME ?= 2026.05.27-14:54+0200
 ifneq ($(BOOT_CODE_TIME_OVERRIDE),)
 BOOT_CODE_TIME := $(BOOT_CODE_TIME_OVERRIDE)
 endif

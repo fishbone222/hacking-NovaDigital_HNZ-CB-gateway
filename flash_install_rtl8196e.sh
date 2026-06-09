@@ -97,7 +97,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes) CONFIRM="y" ;;
         --help|-h)
-            echo "Usage: $0 [-y] [--boot-ip <IP>] [LINUX_IP]"
+            echo "Usage: $0 [-y] [--boot-ip <IP|host>] [LINUX_IP]"
             echo ""
             echo "Installs custom firmware on the Lidl Silvercrest Gateway."
             echo ""
@@ -107,8 +107,8 @@ while [ $# -gt 0 ]; do
             echo ""
             echo "Options:"
             echo "  -y, --yes        Non-interactive mode (skip all prompts)"
-            echo "  --boot-ip <IP>   Bootloader-mode / TFTP server IP (overrides BOOT_IP env;"
-            echo "                   default: 192.168.1.6)"
+            echo "  --boot-ip <IP|host>  Bootloader-mode / TFTP server IP (overrides BOOT_IP"
+            echo "                   env; default: 192.168.1.6). A hostname is resolved host-side."
             echo ""
             echo "Environment: BOOT_IP (default: 192.168.1.6), SSH_TIMEOUT,"
             echo "  SSH_PASSWORD (sshpass), NET_MODE, RADIO_MODE, CONFIRM,"
@@ -133,10 +133,16 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# Apply --boot-ip override (flag > env > default) and validate.
+# Apply --boot-ip override (flag > env > default), resolving a hostname if one
+# was given (the on-device boothold/bootloader need a literal IPv4 — resolve
+# host-side). A dotted-quad passes through unchanged.
 [ -n "$BOOT_IP_FLAG" ] && BOOT_IP="$BOOT_IP_FLAG"
-if ! valid_ipv4 "$BOOT_IP"; then
-    echo "Error: invalid BOOT_IP '$BOOT_IP' (expected dotted-quad IPv4)." >&2
+if BOOT_IP_RESOLVED="$(resolve_ipv4 "$BOOT_IP")"; then
+    [ "$BOOT_IP_RESOLVED" != "$BOOT_IP" ] && echo "Resolved BOOT_IP '$BOOT_IP' -> $BOOT_IP_RESOLVED"
+    BOOT_IP="$BOOT_IP_RESOLVED"
+else
+    echo "Error: invalid BOOT_IP '$BOOT_IP' (not a dotted-quad IPv4, and could" >&2
+    echo "not be resolved as a hostname)." >&2
     exit 1
 fi
 
@@ -197,6 +203,76 @@ require_boot_l2() {
         echo "Then re-run this script. Remove the address afterwards with 'ip addr del'." >&2
         exit 1
     fi
+}
+
+# Build fullflash.bin, sanity-check it, and ask the final confirmation.
+# On the upgrade (auto) path this runs while Linux is still up — BEFORE boothold —
+# so the slow image build does not happen with the gateway stranded in the
+# bootloader, and an abort (or a build failure) leaves Linux untouched. On a
+# first flash / manual entry it runs at the convergence point (gateway already in
+# the bootloader), where build_fullflash.sh prompts interactively for IP/radio.
+# Sets GW_HINT_IP, FULLFLASH and the IMAGE_READY guard so the convergence point
+# does not build a second time.
+build_image_and_confirm() {
+    # In the upgrade path SKELETON_DIR is already exported (with saved config
+    # from the running gateway). On a first flash the parent has no SKEL_WORK
+    # yet, but build_fullflash.sh will prompt for IP/radio and write into
+    # whatever SKELETON_DIR points to. We pre-create one here so the parent
+    # can read back the chosen IPADDR for the post-install hint, instead of
+    # losing it when build_fullflash's own mktemp dir is reaped.
+    if [ -z "${SKELETON_DIR:-}" ]; then
+        USERDATA_SKEL="${SCRIPT_DIR}/3-Main-SoC-Realtek-RTL8196E/34-Userdata/skeleton"
+        SKEL_WORK=$(mktemp -d)
+        cp -a "$USERDATA_SKEL/." "$SKEL_WORK/"
+        trap 'rm -rf "$SKEL_WORK"; ssh_cleanup_multiplex' EXIT
+        export SKELETON_DIR="$SKEL_WORK"
+    fi
+
+    # Called with -q (quiet): only config → lines, errors, and a summary are
+    # shown. Run build_fullflash.sh without -q for full verbose output.
+    "${SCRIPT_DIR}/build_fullflash.sh" -q
+
+    # Read back the IP the user picked (or kept) so the post-install hints
+    # show the right address. Fall back to LINUX_IP (upgrade path) or the
+    # default for first-time installs that chose DHCP / left the default.
+    if [ -z "${IPADDR:-}" ] && [ -f "${SKELETON_DIR}/etc/eth0.conf" ]; then
+        IPADDR=$(awk -F= '$1=="IPADDR"{print $2; exit}' "${SKELETON_DIR}/etc/eth0.conf" 2>/dev/null || true)
+    fi
+    GW_HINT_IP="${LINUX_IP:-${IPADDR:-192.168.1.88}}"
+
+    FULLFLASH="${SCRIPT_DIR}/fullflash.bin"
+    if [ ! -f "$FULLFLASH" ]; then
+        echo "Error: fullflash.bin not found after build." >&2
+        exit 1
+    fi
+
+    FLASH_SIZE=$((16 * 1024 * 1024))
+    ff_size=$(stat -c%s "$FULLFLASH")
+    if [ "$ff_size" -ne "$FLASH_SIZE" ]; then
+        echo "Error: fullflash.bin is ${ff_size} bytes (expected ${FLASH_SIZE})." >&2
+        exit 1
+    fi
+
+    # --- confirm: last chance to abort. Skipped in non-interactive mode. ------
+    echo ""
+    echo "WARNING: This will overwrite the ENTIRE flash chip (16 MiB)."
+    if [ "$CONFIG_SAVED" = "1" ]; then
+        echo "Your saved config (network, password, SSH keys, radio, Thread"
+        echo "credentials) will be re-injected; everything else is replaced."
+    else
+        echo "All data on the gateway will be replaced."
+    fi
+    echo ""
+    echo "  Image:  fullflash.bin ($(md5sum "$FULLFLASH" | awk '{print $1}'))"
+    echo "  Target: ${BOOT_IP}"
+    echo ""
+
+    if [ "${CONFIRM:-}" != "y" ]; then
+        read -r -p "Proceed? [y/N] " confirm
+        if [[ ! "$confirm" =~ ^[yY]$ ]]; then echo "Aborted."; exit 0; fi
+    fi
+
+    IMAGE_READY=1
 }
 
 
@@ -352,6 +428,14 @@ EOF
         # their network mid-flow.
         require_boot_l2
 
+        # Build the image (and take the final confirmation) NOW, while Linux is
+        # still up. The saved config is already in SKELETON_DIR, so the image
+        # has everything it needs — no bootloader state is required. Doing it
+        # here means the slow build no longer runs with the gateway stranded in
+        # the bootloader; only the TFTP upload + flash write block the gateway.
+        # An abort at the confirmation (or a build failure) leaves Linux intact.
+        build_image_and_confirm
+
         # Pass BOOT_IP to boothold (V2.7+): the bootloader comes up on that
         # address in download mode, so a non-default BOOT_IP needs no serial
         # IPCONFIG. Older boothold ignores the argument (stays at 192.168.1.6).
@@ -473,67 +557,12 @@ if [ -z "$LINUX_RUNNING" ] && [ "${CONFIRM:-}" != "y" ]; then
     fi
 fi
 
-# --- build fullflash.bin -----------------------------------------------------
-# Called with -q (quiet): only config → lines, errors, and a summary are shown.
-# Run build_fullflash.sh without -q for full verbose output.
-#
-# In the upgrade path SKELETON_DIR is already exported (with saved config
-# from the running gateway). On a first flash the parent has no SKEL_WORK
-# yet, but build_fullflash.sh will prompt for IP/radio and write into
-# whatever SKELETON_DIR points to. We pre-create one here so the parent
-# can read back the chosen IPADDR for the post-install hint, instead of
-# losing it when build_fullflash's own mktemp dir is reaped.
-if [ -z "${SKELETON_DIR:-}" ]; then
-    USERDATA_SKEL="${SCRIPT_DIR}/3-Main-SoC-Realtek-RTL8196E/34-Userdata/skeleton"
-    SKEL_WORK=$(mktemp -d)
-    cp -a "$USERDATA_SKEL/." "$SKEL_WORK/"
-    trap 'rm -rf "$SKEL_WORK"; ssh_cleanup_multiplex' EXIT
-    export SKELETON_DIR="$SKEL_WORK"
-fi
-
-"${SCRIPT_DIR}/build_fullflash.sh" -q
-
-# Read back the IP the user picked (or kept) so the post-install hints
-# show the right address. Fall back to LINUX_IP (upgrade path) or the
-# default for first-time installs that chose DHCP / left the default.
-if [ -z "${IPADDR:-}" ] && [ -f "${SKELETON_DIR}/etc/eth0.conf" ]; then
-    IPADDR=$(awk -F= '$1=="IPADDR"{print $2; exit}' "${SKELETON_DIR}/etc/eth0.conf" 2>/dev/null || true)
-fi
-GW_HINT_IP="${LINUX_IP:-${IPADDR:-192.168.1.88}}"
-
-FULLFLASH="${SCRIPT_DIR}/fullflash.bin"
-if [ ! -f "$FULLFLASH" ]; then
-    echo "Error: fullflash.bin not found after build." >&2
-    exit 1
-fi
-
-FLASH_SIZE=$((16 * 1024 * 1024))
-ff_size=$(stat -c%s "$FULLFLASH")
-if [ "$ff_size" -ne "$FLASH_SIZE" ]; then
-    echo "Error: fullflash.bin is ${ff_size} bytes (expected ${FLASH_SIZE})." >&2
-    exit 1
-fi
-
-# --- confirm -----------------------------------------------------------------
-# Last chance to abort. Skipped in non-interactive mode (-y / CONFIRM=y).
-
-echo ""
-echo "WARNING: This will overwrite the ENTIRE flash chip (16 MiB)."
-if [ "$CONFIG_SAVED" = "1" ]; then
-    echo "Your saved config (network, password, SSH keys, radio, Thread"
-    echo "credentials) will be re-injected; everything else is replaced."
-else
-    echo "All data on the gateway will be replaced."
-fi
-echo ""
-echo "  Image:  fullflash.bin ($(md5sum "$FULLFLASH" | awk '{print $1}'))"
-echo "  Target: ${BOOT_IP}"
-echo ""
-
-if [ "${CONFIRM:-}" != "y" ]; then
-    read -r -p "Proceed? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[yY]$ ]]; then echo "Aborted."; exit 0; fi
-fi
+# --- build fullflash.bin + final confirmation --------------------------------
+# On the upgrade (auto) path this already ran before boothold, while Linux was
+# still up — IMAGE_READY is set, so we skip it here. On a first flash / manual
+# entry the gateway is already in the bootloader and nothing was built yet:
+# build now (build_fullflash.sh prompts interactively for IP/radio).
+[ "${IMAGE_READY:-}" = "1" ] || build_image_and_confirm
 
 # --- flash --------------------------------------------------------------------
 # One shared routine, no firmware-version logic. We always upload the image (both
@@ -561,6 +590,12 @@ manual_flw_guidance() {
         exit 1
     fi
     echo ""
+    echo "NOTE: a custom (V2.x) bootloader may auto-flash the uploaded image on its"
+    echo "own even when this script could not detect it. If the gateway reboots and"
+    echo "comes back on SSH within ~2 min (ssh root@${GW_HINT_IP:-<gateway>}), the"
+    echo "flash already succeeded — you are done and can ignore the steps below."
+    echo "The steps below are only for stock/older bootloaders that need a manual FLW."
+    echo ""
     echo "The image is in the gateway's RAM at 0x80500000. On the serial console"
     echo "(38400 8N1, line wrap ON), type:"
     echo ""
@@ -571,9 +606,17 @@ manual_flw_guidance() {
     read -r -p "Has the flash completed (FLW back at the <RealTek> prompt)? [y/N] " flw_done
     if [[ ! "$flw_done" =~ ^[yY]$ ]]; then
         echo ""
-        echo "Flash not confirmed — nothing was changed if you did not run FLW."
-        echo "The image is still in RAM at 0x80500000: run the FLW above and reboot"
-        echo "manually, or re-run this script to upload again."
+        echo "Manual FLW not confirmed. Before doing anything else, check whether the"
+        echo "gateway auto-flashed on its own (custom V2.x bootloaders often do, even"
+        echo "when this script could not detect it):"
+        echo ""
+        echo "    ping ${GW_HINT_IP:-<gateway>}      # wait up to ~2 min for the reboot"
+        echo "    ssh root@${GW_HINT_IP:-<gateway>}"
+        echo ""
+        echo "If it answers, the flash already succeeded — you are done."
+        echo "If it stays unreachable, nothing was written: the image is still in RAM"
+        echo "at 0x80500000 — run the FLW above and reboot manually (J BFC00000), or"
+        echo "re-run this script to upload again."
         exit 1
     fi
     echo ""
@@ -635,8 +678,22 @@ print_complete() {
 
 # Pre-upload capability probe (see note at top of file): Tuya / pre-ICMP stock
 # bootloaders never answer ping and have no auto-flash.
+#
+# Poll instead of a single probe: the custom V2.5 bootloader can take a second
+# or two after ARP resolves before its ICMP responder is up. Now that the image
+# is built *before* boothold, this runs immediately after bootloader detection
+# with no multi-minute build to mask that settle window — a single ping flaked
+# to "no" and wrongly picked the manual path even though auto-flash worked
+# (issue: gateway re-flashed fine but the script printed manual FLW guidance).
+# A genuine Tuya / pre-v2 bootloader never answers, so the window is exhausted
+# (~10 s, only on the already-manual path) and we correctly fall through.
 PING_BEFORE=no
-ping -c 1 -W 2 "$BOOT_IP" >/dev/null 2>&1 && PING_BEFORE=yes
+for _i in $(seq 1 10); do
+    if ping -c 1 -W 1 "$BOOT_IP" >/dev/null 2>&1; then
+        PING_BEFORE=yes
+        break
+    fi
+done
 
 echo ""
 echo "Uploading fullflash.bin via TFTP (16 MiB)..."
