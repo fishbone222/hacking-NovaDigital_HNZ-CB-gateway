@@ -13,6 +13,12 @@
  *   PWM frequency = 62.5 Hz (above flicker threshold).
  *   Brightness 60/255 ≈ 1/4 duty cycle (25%).
  *
+ * The sysfs interface keeps the standard LED-class 0-255 scale, but the
+ * 4-jiffy window quantizes intermediate values to 4 physical duty levels
+ * (25/50/75/100%). Raising the resolution would lower the PWM frequency
+ * in the same ratio (8 levels -> 31 Hz: visible flicker), so 4 levels at
+ * 62.5 Hz is the deliberate trade-off (issue #120).
+ *
  * DTS compatible: "gpio-leds-pwm"  (same child-node syntax as gpio-leds)
  *
  * Copyright (C) 2025 Jacques Nilo
@@ -68,7 +74,16 @@ static void gpio_pwm_timer_fn(struct timer_list *t)
 	if (led->counter >= PWM_PERIOD_JIFFIES)
 		led->counter = 0;
 
-	mod_timer(&led->timer, jiffies + 1);
+	/*
+	 * Re-arm for the next tick. The timer wheel rounds every expiry up
+	 * by one level granularity so a timer can never fire early
+	 * (calc_index() in kernel/time/timer.c): "jiffies + 1" lands in the
+	 * "jiffies + 2" bucket, doubling the PWM step to 8 ms and halving
+	 * the PWM frequency to 31 Hz — visible flicker (issue #120).
+	 * "jiffies" (expire ASAP) is bucketed at the next tick, giving a
+	 * true 4 ms step; it cannot fire earlier than that by construction.
+	 */
+	mod_timer(&led->timer, jiffies);
 }
 
 /* ----- brightness_set --------------------------------------------------- */

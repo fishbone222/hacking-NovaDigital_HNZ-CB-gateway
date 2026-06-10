@@ -58,7 +58,7 @@
 #include <asm/ptrace.h>
 
 #define DRIVER_NAME		"rtl819x-wdt"
-#define DRV_VERSION		"1.3"
+#define DRV_VERSION		"1.4"
 
 /*
  * WDTCNR bit layout (sysc + 0x311C) — verified against the
@@ -196,6 +196,15 @@
  *                            (hrtimer_collect_pending_fns()), for an
  *                            HRTIMER_SOFTIRQ storm. watchdog_timer_fn / the
  *                            tick handler appear as expected noise.
+ *   +0x13C u32   overdue     jiffies the earliest queued wheel timer is past
+ *                            its expiry at panic (timer_wheel_stats()).
+ *                            Large (thousands) => the wheel has fallen behind
+ *                            and never catches up — a processing death
+ *                            spiral; ~0 => the storming vector is re-raised
+ *                            over a wheel that is keeping up. The
+ *                            discriminator #99 captures were missing.
+ *                            0xFFFFFFFF = sentinel "walk did not complete".
+ *   +0x140 u32   npend       total timers queued in the wheel at panic.
  *
  * The candidate lists are cold-path only (read in the panic notifier), so
  * normal operation pays nothing — unlike the storm-2/3 hot-path rings that
@@ -205,11 +214,15 @@
  *   v1 (firmware v3.7.0)  magic..reason
  *   v2 (firmware v3.8.0)  + epc@+0xF0, ra@+0xF4, softirq@+0xF8,
  *                           timer/hrtimer candidate lists@+0x100/+0x120
+ *   v3 (firmware v3.8.3)  + delayed_work entries in tfns resolved to their
+ *                           work->func (kernel-time-timer.c.patch), wheel
+ *                           overdue@+0x13C, pending count@+0x140
  */
 #define WDT_REC_PHYS		0x01FFE000U
 #define WDT_REC_SIZE		0x200U
 #define WDT_REC_MAGIC		0x50414E43U	/* "PANC" */
-#define WDT_REC_VERSION		2U
+#define WDT_REC_VERSION		3U
+#define WDT_REC_VERSION_V2	2U	/* still decoded: one-boot leftover after upgrade */
 #define WDT_REC_OFF_MAGIC	0x00
 #define WDT_REC_OFF_VERSION	0x04
 #define WDT_REC_OFF_UPTIME	0x08
@@ -223,7 +236,10 @@
 #define WDT_REC_OFF_NTFN	0x100		/* u32 timer-wheel candidate count */
 #define WDT_REC_OFF_TFNS	0x104		/* WDT_REC_NR_FNS u32 (..0x11B) */
 #define WDT_REC_OFF_NHFN	0x120		/* u32 hrtimer candidate count */
-#define WDT_REC_OFF_HFNS	0x124		/* WDT_REC_NR_FNS u32 (..0x13B), clear of boothold@0xFF4 */
+#define WDT_REC_OFF_HFNS	0x124		/* WDT_REC_NR_FNS u32 (..0x13B) */
+#define WDT_REC_OFF_LAG		0x13C		/* u32 wheel overdue (jiffies) */
+#define WDT_REC_OFF_NPEND	0x140		/* u32 total queued wheel timers (..0x143, clear of boothold@0xFF4) */
+#define WDT_REC_STAT_UNSET	0xFFFFFFFFU	/* sentinel: stats walk did not complete */
 
 static bool nowayout = WATCHDOG_NOWAYOUT;
 module_param(nowayout, bool, 0444);
@@ -403,7 +419,9 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 	 *   1. Write the *core* record — only non-walking reads (uptime, reason,
 	 *      fn, epc, ra, softirq), candidate counts zeroed — then magic last
 	 *      (with a barrier) so the next boot never reads a torn record.
-	 *   2. Arm the reset (WDTCNR=0 → ~1.31 s grace overflow).
+	 *   2. Arm the reset: clear the counter while the watchdog is halted,
+	 *      then enable (OVSEL=0 → ~1.31 s grace). Two writes, deliberately
+	 *      — see the race note at the arm site below.
 	 *   3. ONLY THEN do the best-effort timer/hrtimer wheel walks, within the
 	 *      grace window, writing each list's count *after* its entries.
 	 * A diagnostic wheel walk must never be able to delay recovery or lose the
@@ -425,6 +443,8 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 		writel((u32)local_softirq_pending(), wdt->rec + WDT_REC_OFF_SOFTIRQ);
 		writel(0, wdt->rec + WDT_REC_OFF_NTFN);	/* until the walks below fill them */
 		writel(0, wdt->rec + WDT_REC_OFF_NHFN);
+		writel(WDT_REC_STAT_UNSET, wdt->rec + WDT_REC_OFF_LAG);
+		writel(0, wdt->rec + WDT_REC_OFF_NPEND);
 		memset_io(wdt->rec + WDT_REC_OFF_REASON, 0, WDT_REC_REASON_MAX);
 		memcpy_toio(wdt->rec + WDT_REC_OFF_REASON, reason, n);
 		wmb();
@@ -432,11 +452,28 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 		wmb();
 	}
 
-	/* Arm the ~1.31 s reset before any best-effort wheel walk. */
+	/*
+	 * Arm the ~1.31 s reset (OVSEL=0 = 2^15 ticks @ 25 kHz) before any
+	 * best-effort wheel walk — in TWO steps, and that matters:
+	 *
+	 * When the userspace kicker has the watchdog running (OVSEL=9), the
+	 * up-counter at panic time holds up to kick-interval x 25k ticks,
+	 * far above the 2^15 OVSEL=0 threshold. A single arm write — bare 0
+	 * (v1.3) or 0|WDTCLR — lets the enable see that stale counter
+	 * before the kick takes effect, and the chip resets INSTANTLY: the
+	 * bench breadcrumbs showed not even one instruction after the write
+	 * executing, which is how v1.3 silently lost every candidate list
+	 * (timers=[none]). Clearing the counter while the watchdog is still
+	 * halted (WDTE=0xA5 + WDTCLR), then enabling, removes the race: the
+	 * counter provably starts from 0.
+	 */
+	writel(WDT_DISABLE_PATTERN | WDTCLR, wdt->base);
 	writel(0, wdt->base);
 
 	if (wdt->rec) {
 		void *fns[WDT_REC_NR_FNS];
+		unsigned long overdue;
+		unsigned int npend;
 		int i, nt, nh;
 
 		nt = timer_collect_pending_fns(fns, WDT_REC_NR_FNS);
@@ -452,6 +489,12 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 			       wdt->rec + WDT_REC_OFF_HFNS + i * 4);
 		wmb();
 		writel((u32)nh, wdt->rec + WDT_REC_OFF_NHFN);
+
+		/* Wheel backlog last: candidates are the irreplaceable part. */
+		timer_wheel_stats(&overdue, &npend);
+		writel((u32)npend, wdt->rec + WDT_REC_OFF_NPEND);
+		wmb();
+		writel((u32)overdue, wdt->rec + WDT_REC_OFF_LAG); /* clears the sentinel */
 	}
 
 	return NOTIFY_DONE;
@@ -521,7 +564,7 @@ static void rtl819x_wdt_report_panic_record(struct rtl819x_wdt *wdt)
 {
 	struct device *dev = wdt->wdd.parent;
 	char reason[WDT_REC_REASON_MAX];
-	char sirq[64], tfns[256], hfns[256];
+	char sirq[64], tfns[256], hfns[256], wstat[48];
 	u32 up, fna, epc, ra, sirqmask, ver;
 
 	if (!wdt->rec)
@@ -538,16 +581,26 @@ static void rtl819x_wdt_report_panic_record(struct rtl819x_wdt *wdt)
 	memcpy_fromio(reason, wdt->rec + WDT_REC_OFF_REASON, WDT_REC_REASON_MAX);
 	reason[WDT_REC_REASON_MAX - 1] = '\0';
 
-	if (ver == WDT_REC_VERSION) {
+	if (ver == WDT_REC_VERSION || ver == WDT_REC_VERSION_V2) {
 		rtl819x_wdt_softirq_decode(sirqmask, sirq, sizeof(sirq));
 		rtl819x_wdt_fns_decode(wdt, WDT_REC_OFF_NTFN, WDT_REC_OFF_TFNS,
 				       tfns, sizeof(tfns));
 		rtl819x_wdt_fns_decode(wdt, WDT_REC_OFF_NHFN, WDT_REC_OFF_HFNS,
 				       hfns, sizeof(hfns));
+		wstat[0] = '\0';
+		if (ver >= WDT_REC_VERSION) {
+			u32 lag = readl(wdt->rec + WDT_REC_OFF_LAG);
+			u32 npend = readl(wdt->rec + WDT_REC_OFF_NPEND);
+
+			if (lag != WDT_REC_STAT_UNSET)
+				scnprintf(wstat, sizeof(wstat),
+					  " overdue=%uj pending=%u", lag, npend);
+		}
 		dev_info(dev,
-			 "previous boot ended in panic: uptime=%us pc=%pS ra=%pS running=%pS softirq=0x%x[%s] timers=[%s] hrtimers=[%s] reason=\"%s\"\n",
+			 "previous boot ended in panic: uptime=%us pc=%pS ra=%pS running=%pS softirq=0x%x[%s] timers=[%s] hrtimers=[%s]%s reason=\"%s\"\n",
 			 up, (void *)(uintptr_t)epc, (void *)(uintptr_t)ra,
-			 (void *)(uintptr_t)fna, sirqmask, sirq, tfns, hfns, reason);
+			 (void *)(uintptr_t)fna, sirqmask, sirq, tfns, hfns,
+			 wstat, reason);
 	} else {
 		dev_info(dev, "previous boot ended in panic (unknown record v%u)\n",
 			 ver);
@@ -737,6 +790,7 @@ static struct platform_driver rtl819x_wdt_driver = {
 };
 
 module_platform_driver(rtl819x_wdt_driver);
+
 
 MODULE_AUTHOR("Jacques Nilo");
 MODULE_DESCRIPTION("Hardware watchdog for Realtek RTL8196E SoC");

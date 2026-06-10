@@ -6,6 +6,50 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.8.3] - 2026-06-10
+
+_Kernel-only changes: status-LED dimming fix and watchdog post-mortem v3
+(issue #99 instrumentation). No bootloader, rootfs or userdata change._
+
+### `leds-gpio-pwm` — status LED flickered at 31 Hz instead of dimming (issue #120)
+
+Since the Linux 4.8 timer-wheel rework the kernel rounds every timer expiry
+up by one jiffy so a timer can never fire early: the driver's per-jiffy
+re-arm at `jiffies + 1` actually fired every 2 ticks, doubling the PWM step
+to 8 ms and halving the PWM frequency to the 31 Hz flicker scoped in issue
+#120. Re-arming at `jiffies` (expire ASAP — bucketed at the next tick by
+construction) restores the designed 62.5 Hz.
+
+* Bench (GPIO 11 sampler, brightness 60/128/192): 31.3–31.5 Hz before,
+  62.5 Hz after (4/12, 8/8, 12/4 ms).
+* The sysfs scale stays 0–255; the 4-level duty quantization (25/50/75/100 %)
+  and the frequency-vs-resolution trade-off are now documented in the driver
+  header.
+
+### `rtl819x-wdt` v1.4 — panic-path arm race fixed, panic record v3 (issue #99)
+
+* **v1.3 regression fixed — candidate lists were silently lost.** v1.3 armed
+  the recovery reset before the best-effort wheel walks with a single
+  `WDTCNR=0` write, assuming a ~1.31 s grace window. With the userspace
+  kicker active the up-counter sits far above the OVSEL=0 threshold and the
+  chip resets *instantly* — DRAM breadcrumbs on the bench showed not one
+  instruction executing after the arm write, so every v3.8.1 field capture
+  would have come back `timers=[none]`. The arm is now two writes: clear the
+  counter while the watchdog is halted (no race), then enable.
+* **`delayed_work` candidates resolved to their work function.** The first
+  issue #99 record-v2 field capture (2026-06-09) returned four
+  indistinguishable `delayed_work_timer_fn` wrappers;
+  `timer_collect_pending_fns()` now resolves them one level deeper (e.g.
+  `neigh_managed_work`).
+* **Wheel backlog captured — record v3.** New fields `overdue=` (jiffies the
+  earliest queued timer is past expiry) and `pending=` (total queued timers)
+  discriminate the two storm shapes behind #99: a wheel that never catches
+  up (death spiral — large overdue) vs a softirq re-raised over a caught-up
+  wheel (overdue ≈ 0). Bench: `overdue=0j` on a healthy crash,
+  `overdue=6269j` (25.1 s of wheel starvation) under an injected soft-lockup.
+* A leftover v2 record from a pre-upgrade crash still decodes on the one
+  upgrade boot.
+
 ## [3.8.2] - 2026-06-09
 
 _Host-side flashing-tooling and UX release. No on-device firmware behavior
