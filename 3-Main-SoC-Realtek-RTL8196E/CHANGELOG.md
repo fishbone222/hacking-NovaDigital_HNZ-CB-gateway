@@ -6,6 +6,101 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.10.0] - 2026-06-11
+
+_Kernel + userdata + host-tooling changes. No bootloader or rootfs change —
+existing installs upgrade with `flash_install_rtl8196e.sh` (your config is
+preserved); the flashing fixes arrive with a plain `git pull`. Issue #99
+soak boxes should stay on v3.8.3 (frozen baseline)._
+
+### Device tree now describes the board wiring (discussions #122/#123/#124)
+
+Board facts move out of code and into the DTS, so porting to an RTL8196E
+twin (e.g. Sengled G4, discussion #119) no longer means patching drivers:
+
+* `gpio-line-names` on the gpio controller node names the SoC lines
+  (`reset-button` at line 9, `status-led` at 11, `efr32-nrst` at 12 on the
+  Lidl board).
+* New optional `/radio-bridge` node (`compatible =
+  "realtek,rtl8196e-uart-bridge"`) seeds the bridge defaults at boot:
+  `nrst-gpios` and `flow-control = "hw" | "sw" | "none"`. Module
+  parameters and runtime sysfs still override (DT < cmdline < sysfs).
+* One dtb per board: the devicetree Kconfig choice gains an add-a-board
+  recipe, the dts Makefile moves from a patch to the `files-6.18/`
+  overlay, and `BOARD=<board> ./build_kernel.sh` selects the board
+  (default `lidl`).
+
+### `rtl8196e-uart-bridge` v1.2 — software flow control (discussion #123)
+
+`flow_control` is now tri-state: `0`/`none`, `1`/`hw` (RTS/CTS, default),
+`2`/`sw` (XON/XOFF). In sw mode the bridge itself scans the radio→host
+stream for bare XON/XOFF, strips them from the TCP stream, and gates the
+TCP→UART direction (pause on XOFF, resume on XON, bounded 1 s fail-open) —
+the hot path bypasses the tty line discipline, so termios IXON/IXOFF would
+be inert. Remote hosts (Z2M over TCP) see a clean ASH stream and need no
+software-flow support of their own. New `xoff` / `xon` /
+`tx_pause_timeouts` counters in `parameters/stats`. Sysfs readback stays
+numeric, so existing tooling (`flash_efr32.sh`) is unaffected. During an
+EFR32 flash, flow control must be `0` in all modes (Xmodem payloads
+contain raw XON/XOFF bytes).
+
+### `s40button` v2 — button read through the GPIO cdev (discussion #122)
+
+The front-panel button daemon no longer touches GPIO registers via
+`/dev/mem`: it claims its line through `/dev/gpiochip0` (uAPI v2 ioctls,
+no libgpiod, still a small static binary). The line is found by DTS name
+(`reset-button`), with a fallback to line 9 and a `-p <line>` override for
+bring-up. Claiming through the kernel also applies the PIN_MUX_SEL_2
+pad-mux for pads B2–B6 in the gpio driver's request hook — which is what
+kept a button on pad B6 (the G4) dead under v1. Press logic unchanged
+(100 ms poll, 5 s long-press → `recover_efr32 -q`).
+
+### `S20time` — ntpd now runs as a daemon (issue #125)
+
+The old script ran a one-shot `ntpd -q` behind a ping gate and exited for
+good if the network was not up at boot; with no RTC the clock then stayed
+at the 1970 epoch for the whole uptime. `ntpd` now starts unconditionally
+as a daemon: it retries forever (DNS failures included, backoff capped at
+~4 min), steps the clock whenever internet appears, and keeps disciplining
+it afterwards — no more long-term drift on month-long uptimes. Measured
+cost on the gateway: ~100–200 kB private RSS, ~0.03 % CPU in its busiest
+phase, one 48-byte UDP exchange per poll interval (32 s → ~1.1 h).
+
+### `flash_install_rtl8196e.sh` — no more false "manual flash required" (discussion #115)
+
+After `boothold`, the script accepted a bare ARP reply as "bootloader
+detected" — but a shutting-down Linux keeps answering ARP for a few
+seconds after SSH dies, so everything downstream could run against a
+rebooting box: the ICMP classification called a V2.7 bootloader "Tuya /
+pre-v2" (false "manual flash required" on a flash that succeeded), or the
+16 MiB upload sat in a 5-minute timeout against nothing.
+
+* Detection now requires the bootloader's TFTP server to ACK a 1-byte
+  write probe, not just ARP.
+* The boothold path skips ICMP classification entirely — it reached the
+  bootloader through `boothold`, so "Tuya" is impossible by construction.
+* Auto-flash confirmation is dual-channel: the bootloader's UDP:9999
+  notification (lost to host firewalls or netcat variants) OR the gateway
+  coming back up on SSH at its known address. A firewall can no longer
+  turn a successful flash into a scary message.
+* Failure paths now state explicitly that nothing was written, and that
+  pre-V2.7 bootloaders ignore the `--boot-ip` handoff (they always come
+  up at 192.168.1.6).
+
+### Documentation
+
+READMEs synced with the changes above: the uart-bridge pages (tri-state
+flow control, `/radio-bridge` device-tree seeding, new stats counters),
+the kernel build page (`BOARD=` board selection and the add-a-board
+recipe), the userdata page (bridge sysfs table, ntpd daemon), and the
+EFR32 flashing page (three-mode flow-control table). The root README now
+presents the project as a platform portable to other RTL8196E-based
+gateways, and leads the RCP/OT-RCP firmware choices with what they
+actually buy you: EmberZNet 8.2 host-side (cpcd + zigbeed) and
+Zigbee2MQTT's ZigBee-on-Host (`zoh`) adapter.
+
+---
+
 ## [3.9.0] - 2026-06-10
 
 _Kernel-only changes: Linux 6.18.35 rebase, release-stamped `uname -r`, and

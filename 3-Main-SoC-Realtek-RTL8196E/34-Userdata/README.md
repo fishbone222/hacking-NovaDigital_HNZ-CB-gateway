@@ -27,7 +27,7 @@ Execute init scripts:
   S05syslog      → Start system logging
   S10network     → Configure network (DHCP or static)
   S15hostname    → Set hostname, /etc/hosts
-  S20time        → Sync time via NTP
+  S20time        → Set timezone, start the ntpd daemon
   S30dropbear    → Start SSH server
   S50uart_bridge → Arm the in-kernel UART↔TCP bridge (skipped if radio mode = otbr)
   S70otbr        → Start Thread border router (if radio mode = otbr)
@@ -276,12 +276,16 @@ coordinators to communicate with the Silabs EFR32 radio remotely.
 | `baud` | `460800` via `FIRMWARE_BAUD` in `/userdata/etc/radio.conf` | UART baud rate |
 | `port` | `8888` | TCP listen port (root only) |
 | `bind_addr` | `0.0.0.0` | TCP bind address (root only) |
-| `flow_control` | `1` | Hardware RTS/CTS (set `0` for EFR32 flash) |
+| `flow_control` | `1` | `0`/`none`, `1`/`hw` (RTS/CTS), `2`/`sw` (XON/XOFF) — set `0` for EFR32 flash; readback is numeric |
 | `enable` | `0` → `1` by S50uart_bridge | 1=armed, 0=disarmed |
 | `armed` | read-only | Actual bridge state |
 | `stats` | read-only | Live rx/tx/drop counters |
 
-All under `/sys/module/rtl8196e_uart_bridge/parameters/`. Example:
+All under `/sys/module/rtl8196e_uart_bridge/parameters/`. The table above
+is the day-to-day subset; the full parameter list (`nrst_pulse`,
+`nrst_gpio`, …), the device-tree seeding and the stats reference are in the
+[bridge README](../32-Kernel/files-6.18/drivers/net/rtl8196e-uart-bridge/README.md).
+Example:
 
 ```bash
 # Change baud rate at runtime (no disarm needed)

@@ -1,22 +1,29 @@
 /*
  * s40button — front-panel button daemon for the Lidl Silvercrest Gateway.
  *
- * Polls GPIO 9 every 100 ms; on a confirmed 5 s long-press, invokes
- * /usr/sbin/recover_efr32 -q to reset the EFR32 radio without rebooting
- * the SoC.  Replaces the v3.2.x/v3.3.0 busybox shell loop, which had an
- * intermittent SIGSEGV after some hours of idle polling (via
+ * Polls the reset button GPIO every 100 ms; on a confirmed 5 s long-press,
+ * invokes /usr/sbin/recover_efr32 -q to reset the EFR32 radio without
+ * rebooting the SoC.  Replaces the v3.2.x/v3.3.0 busybox shell loop, which
+ * had an intermittent SIGSEGV after some hours of idle polling (via
  * `devmem` + ash).
  *
- * Behaviour parity with the previous shell version:
- *   - Switch GPIO 9 from peripheral mode to GPIO input at startup
- *     (clear bit 9 of CNR @ 0x18003500, ensure bit 9 of DIR is 0).
- *   - 100 ms poll loop on DATA register bit 9 (active LOW).
+ * v2 (discussion #122): the GPIO is accessed through the kernel GPIO
+ * character device (/dev/gpiochip0, uAPI v2 ioctls — no libgpiod), not by
+ * mmap'ing /dev/mem.  The line is found by the name the board DTS gives it
+ * ("reset-button" via gpio-line-names); on kernels without line names the
+ * daemon falls back to line 9 (the Lidl wiring), and -p <line> forces an
+ * explicit offset (bring-up aid for ports, e.g. the Sengled G4 whose
+ * button pad B6 also needs the pad-mux that the kernel gpio-rtl819x
+ * request() hook applies on claim — the very step the v1 /dev/mem poker
+ * never did).  The kernel owns the line for the lifetime of the held
+ * request fd, so the v1 "mux lost at runtime" re-check is gone.
+ *
+ * Behaviour parity with v1 otherwise:
+ *   - 100 ms poll loop, button active LOW (pressed reads 0).
  *   - Edge detection: press detector stays disarmed at boot until a HIGH
  *     is observed.  Guards against a stuck-LOW pin / wrong mux at boot.
  *   - Debounce: require 3 consecutive LOW samples (300 ms) before
  *     treating it as a real press.
- *   - Mux re-verification: re-read CNR before counting; if GPIO 9 was
- *     flipped back to peripheral mode at runtime, restore + disarm.
  *   - Subtle LED blink (every 500 ms, brightness alternates 30/255)
  *     during the hold for visual feedback.
  *   - 5 s sustained press fires recover_efr32; the LED briefly blinks
@@ -26,39 +33,27 @@
  *
  * Build: build_s40button.sh in this tree (Lexra MIPS / musl, static).
  *
- * J. Nilo, April 2026
+ * J. Nilo, April 2026 (v2: June 2026)
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/gpio.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
-#include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-/*
- * GPIO bank lives at physical 0x18003500.  mmap() requires a page-aligned
- * offset, so we map the enclosing 4 KB page (0x18003000) and bias the
- * register pointer by +0x500 after the mapping.
- */
-#define PAGE_SIZE           0x1000u
-#define GPIO_PHYS_BASE      0x18003500u
-#define GPIO_PAGE_BASE      (GPIO_PHYS_BASE & ~(PAGE_SIZE - 1u))
-#define GPIO_PAGE_OFFSET    (GPIO_PHYS_BASE & (PAGE_SIZE - 1u))
-
-#define CNR_OFFSET          0x00u
-#define DIR_OFFSET          0x08u
-#define DATA_OFFSET         0x0Cu
-
-#define BUTTON_BIT          9
-#define BUTTON_MASK         (1u << BUTTON_BIT)
+#define GPIO_CHIP_PATH      "/dev/gpiochip0"
+#define BUTTON_LINE_NAME    "reset-button"
+#define BUTTON_LINE_FALLBACK 9          /* Lidl wiring: GPIO 9 (pad B1) */
 
 #define POLL_INTERVAL_MS    100
 #define LONG_PRESS_MS       5000
@@ -67,35 +62,70 @@
 #define LED_PATH            "/sys/class/leds/status/brightness"
 #define RECOVER_BIN         "/usr/sbin/recover_efr32"
 
-static volatile uint32_t *g_regs;
+static int g_line_fd = -1;
 
-static inline uint32_t reg_read(unsigned offset)
+/*
+ * Find the button line by DTS name; -1 if the chip carries no line names
+ * (kernel predating the gpio-line-names property) or none matches.
+ */
+static int find_line_by_name(int chip_fd, const char *name)
 {
-    return g_regs[offset / 4];
+    struct gpiochip_info ci;
+    uint32_t i;
+
+    memset(&ci, 0, sizeof(ci));
+    if (ioctl(chip_fd, GPIO_GET_CHIPINFO_IOCTL, &ci) < 0)
+        return -1;
+
+    for (i = 0; i < ci.lines; i++) {
+        struct gpio_v2_line_info li;
+
+        memset(&li, 0, sizeof(li));
+        li.offset = i;
+        if (ioctl(chip_fd, GPIO_V2_GET_LINEINFO_IOCTL, &li) < 0)
+            continue;
+        if (strncmp(li.name, name, sizeof(li.name)) == 0)
+            return (int)i;
+    }
+    return -1;
 }
 
-static inline void reg_write(unsigned offset, uint32_t val)
+/*
+ * Claim the line as input.  The gpio-rtl819x request() hook switches the
+ * pad to GPIO mode (and applies the PIN_MUX_SEL_2 pad-mux for pads B2-B6)
+ * as part of this claim.  Returns the line request fd.
+ */
+static int claim_line(int chip_fd, unsigned int offset)
 {
-    g_regs[offset / 4] = val;
-}
+    struct gpio_v2_line_request req;
 
-static int gpio_in_peripheral_mode(void)
-{
-    return (reg_read(CNR_OFFSET) & BUTTON_MASK) != 0;
+    memset(&req, 0, sizeof(req));
+    req.offsets[0] = offset;
+    req.num_lines = 1;
+    req.config.flags = GPIO_V2_LINE_FLAG_INPUT;
+    snprintf(req.consumer, sizeof(req.consumer), "s40button");
+
+    if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0)
+        return -1;
+    return req.fd;
 }
 
 static int button_pressed(void)
 {
-    /* Active LOW: pressed = bit 9 reads 0. */
-    return (reg_read(DATA_OFFSET) & BUTTON_MASK) == 0;
-}
+    struct gpio_v2_line_values lv;
+    static int read_err_logged;
 
-static void configure_gpio(void)
-{
-    /* Clear bit 9 of CNR → switch GPIO 9 to GPIO mode. */
-    reg_write(CNR_OFFSET, reg_read(CNR_OFFSET) & ~BUTTON_MASK);
-    /* Clear bit 9 of DIR → input. */
-    reg_write(DIR_OFFSET, reg_read(DIR_OFFSET) & ~BUTTON_MASK);
+    memset(&lv, 0, sizeof(lv));
+    lv.mask = 1;
+    if (ioctl(g_line_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &lv) < 0) {
+        if (!read_err_logged) {
+            syslog(LOG_ERR, "line read failed: %s", strerror(errno));
+            read_err_logged = 1;
+        }
+        return 0;       /* treat as released; daemon stays alive */
+    }
+    /* Active LOW: pressed = bit reads 0. */
+    return (lv.bits & 1) == 0;
 }
 
 static int led_get(void)
@@ -148,27 +178,66 @@ static void run_recover_efr32(void)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    int fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (fd < 0) {
-        fprintf(stderr, "s40button: open /dev/mem: %s\n", strerror(errno));
+    int forced_line = -1;
+    int chip_fd, line, opt;
+
+    while ((opt = getopt(argc, argv, "p:")) != -1) {
+        switch (opt) {
+        case 'p':
+            forced_line = atoi(optarg);
+            if (forced_line < 0 || forced_line > 31) {
+                fprintf(stderr, "s40button: -p %s out of range (0-31)\n",
+                        optarg);
+                return 1;
+            }
+            break;
+        default:
+            fprintf(stderr, "usage: s40button [-p <line 0-31>]\n");
+            return 1;
+        }
+    }
+
+    chip_fd = open(GPIO_CHIP_PATH, O_RDWR | O_CLOEXEC);
+    if (chip_fd < 0) {
+        fprintf(stderr, "s40button: open %s: %s\n", GPIO_CHIP_PATH,
+                strerror(errno));
         return 1;
     }
-    void *page = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-                      MAP_SHARED, fd, GPIO_PAGE_BASE);
-    close(fd);
-    if (page == MAP_FAILED) {
-        fprintf(stderr, "s40button: mmap GPIO: %s\n", strerror(errno));
-        return 1;
-    }
-    g_regs = (volatile uint32_t *)((char *)page + GPIO_PAGE_OFFSET);
 
     openlog("s40button", LOG_PID, LOG_USER);
-    configure_gpio();
+
+    if (forced_line >= 0) {
+        line = forced_line;
+        syslog(LOG_NOTICE, "using line %d (forced via -p)", line);
+    } else {
+        line = find_line_by_name(chip_fd, BUTTON_LINE_NAME);
+        if (line >= 0) {
+            syslog(LOG_NOTICE, "found \"%s\" at line %d", BUTTON_LINE_NAME,
+                   line);
+        } else {
+            line = BUTTON_LINE_FALLBACK;
+            syslog(LOG_NOTICE,
+                   "no \"%s\" line name on %s (pre-DT-names kernel?), "
+                   "falling back to line %d",
+                   BUTTON_LINE_NAME, GPIO_CHIP_PATH, line);
+        }
+    }
+
+    g_line_fd = claim_line(chip_fd, (unsigned int)line);
+    close(chip_fd);
+    if (g_line_fd < 0) {
+        syslog(LOG_ERR, "claiming line %d failed: %s", line,
+               strerror(errno));
+        fprintf(stderr, "s40button: claiming line %d: %s\n", line,
+                strerror(errno));
+        return 1;
+    }
+
     syslog(LOG_NOTICE,
-           "started: GPIO 9 configured, %dms poll, %ds long-press → %s -q",
-           POLL_INTERVAL_MS, LONG_PRESS_MS / 1000, RECOVER_BIN);
+           "started: line %d claimed, %dms poll, %ds long-press → %s -q",
+           line, POLL_INTERVAL_MS, LONG_PRESS_MS / 1000, RECOVER_BIN);
 
     int saved_led = led_get();
     int armed = 0;
@@ -177,7 +246,7 @@ int main(void)
         if (!button_pressed()) {
             if (!armed) {
                 syslog(LOG_NOTICE,
-                       "GPIO 9 idle (HIGH), press detector armed");
+                       "line %d idle (HIGH), press detector armed", line);
                 armed = 1;
             }
             msleep(POLL_INTERVAL_MS);
@@ -187,17 +256,6 @@ int main(void)
         /* Line is LOW. */
         if (!armed) {
             msleep(POLL_INTERVAL_MS);
-            continue;
-        }
-
-        if (gpio_in_peripheral_mode()) {
-            syslog(LOG_WARNING,
-                   "GPIO 9 reverted to peripheral mode (CNR=0x%08x), "
-                   "restoring + disarming",
-                   reg_read(CNR_OFFSET));
-            configure_gpio();
-            armed = 0;
-            msleep(200);
             continue;
         }
 

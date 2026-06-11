@@ -5,7 +5,7 @@
 
 / {
 	compatible = "realtek,rtl8196e", "realtek,rtl819x-soc";
-	model = "Realtek RTL8196E SoC";
+	model = "Lidl Silvercrest Gateway";
 
 	chosen {
 	    bootargs = "console=ttyS0,38400 loglevel=7 root=/dev/mtdblock2 rootfstype=squashfs";
@@ -40,6 +40,22 @@
 		 * ASIC LED output — GPIO has no physical effect on this LED.
 		 * It is controlled via LEDCREG in the Ethernet driver. */
 	};
+
+	/* Board wiring of the EFR32 radio link, consumed by the in-kernel
+	 * rtl8196e-uart-bridge at init to seed its defaults.  Module
+	 * parameters (kernel cmdline or sysfs) override these values.
+	 * The node is optional: without it the driver falls back to the
+	 * Lidl defaults (nRST on GPIO 12 / pad B4, hardware flow control).
+	 * No platform driver binds here — the bridge looks the node up by
+	 * compatible; the resulting unbound platform device is harmless.
+	 *
+	 * flow-control: "hw" (RTS/CTS), "sw" (XON/XOFF) or "none",
+	 * matching how the board wires the EFR32 UART. */
+	radio-bridge {
+		compatible = "realtek,rtl8196e-uart-bridge";
+		nrst-gpios = <&gpio0 12 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+		flow-control = "hw";
+	};
 };
 
 /* Activation de l'UART0 pour la console */
@@ -53,6 +69,18 @@
 
 &gpio0 {
 	status = "okay";
+
+	/* Board-level names for the SoC GPIO lines (ports A..D, 8 bits
+	 * each).  Userspace finds lines by name through the GPIO cdev
+	 * (s40button looks up "reset-button"), so a different board only
+	 * needs to move the names — no code change.  Unwired lines stay
+	 * empty. */
+	gpio-line-names =
+		"", "", "", "", "", "", "", "",			/* A0-A7  */
+		"", "reset-button", "", "status-led",		/* B0-B3  */
+		"efr32-nrst", "", "", "",			/* B4-B7  */
+		"", "", "", "", "", "", "", "",			/* C0-C7  */
+		"", "", "", "", "", "", "", "";			/* D0-D7  */
 };
 
 &watchdog {

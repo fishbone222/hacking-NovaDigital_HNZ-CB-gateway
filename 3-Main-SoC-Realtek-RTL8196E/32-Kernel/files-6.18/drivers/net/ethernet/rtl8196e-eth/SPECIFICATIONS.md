@@ -38,7 +38,11 @@
 - Ring init uses `netdev_alloc_skb_ip_align(NULL, ...)` (no NAPI context at
   probe time).
 - Pre-allocated SKBs stored in shadow array `rx_bufs[]`
-  (`struct rtl8196e_rx_buf { struct sk_buff *skb }`), one per RX descriptor.
+  (`struct rtl8196e_rx_buf { struct sk_buff *skb }`), one per RX
+  descriptor. Since driver 2.6 the poll path looks the shadow up by
+  the **hardware mbuf index** (pool-bounds guarded; misses counted in
+  `rtl8196e_rx_mbuf_no_shadow`) instead of trusting ring-position
+  correspondence.
 - On each RX: the old SKB is handed to the stack, a new SKB is allocated
   with `napi_alloc_skb(napi, buf_size)`, and its `data` pointer is installed
   in the hardware descriptor.
@@ -59,25 +63,29 @@
   - `mtu` — MTU (default: 1500)
   - `phy-id` — PHY address for MDIO (default: same as port number)
   - `link-poll-ms` — link status polling interval (also on parent node)
-- Extra interface nodes are ignored with a warning.
+- Additional interface nodes are silently ignored (the first child
+  with `reg = <0>` wins; a warning is emitted only when no
+  `interface@0` node is found at all).
 
 ## 6. File architecture
 
 | File              | Role                                                                          | Pure LOC |
 |-------------------|-------------------------------------------------------------------------------|---------:|
-| `rtl8196e_main.c` | net_device, NAPI poll, ISR, TX xmit, ethtool, sysfs (LED), probe/remove       |      574 |
-| `rtl8196e_hw.c`   | MMIO registers, init sequence, KSEG1 helpers, PHY/MDIO, VLAN/NETIF/L2 tables  |      555 |
-| `rtl8196e_ring.c` | TX/RX descriptor rings, kick coalescing, napi_alloc_skb RX buffers, cache ops |      529 |
+| `rtl8196e_main.c` | net_device, NAPI poll, ISR, TX xmit, ethtool, sysfs (LED), probe/remove       |      692 |
+| `rtl8196e_hw.c`   | MMIO registers, init sequence, KSEG1 helpers, PHY/MDIO, VLAN/NETIF/L2 tables  |      584 |
+| `rtl8196e_ring.c` | TX/RX descriptor rings, kick coalescing, napi_alloc_skb RX buffers, cache ops |      627 |
 | `rtl8196e_dt.c`   | Devicetree parsing (`interface@0` properties)                                 |       92 |
-| `rtl8196e_regs.h` | Register definitions (trimmed to what's used)                                 |      133 |
-| `rtl8196e_desc.h` | Hardware descriptor structures (`rtl_pktHdr`, `rtl_mBuf`)                     |       89 |
-| `rtl8196e_ring.h` | Ring API                                                                      |       41 |
-| `rtl8196e_hw.h`   | HW API                                                                        |       29 |
+| `rtl8196e_regs.h` | Register definitions (trimmed to what's used)                                 |      140 |
+| `rtl8196e_desc.h` | Hardware descriptor structures (`rtl_pktHdr`, `rtl_mBuf`)                     |       93 |
+| `rtl8196e_ring.h` | Ring API                                                                      |       60 |
+| `rtl8196e_hw.h`   | HW API                                                                        |       31 |
 | `rtl8196e_dt.h`   | DT API                                                                        |       19 |
-| **Total**         |                                                                               | **2 061** |
+| **Total**         |                                                                               | **2 338** |
 
-Pure LOC = non-blank, non-comment lines.  For comparison, the legacy
-`rtl819x` driver (17 files) totalled ~9 660 pure LOC — a 4.7× reduction.
+Pure LOC = non-blank, non-comment lines, recounted at driver 2.6 (the
+audit batches and the v2.6 ring validators grew the three core files).
+For comparison, the legacy `rtl819x` driver (17 files) totalled ~9 660
+pure LOC — a ~4× reduction.
 
 ## 7. RX path (`napi_alloc_skb`)
 
@@ -165,8 +173,8 @@ Pure LOC = non-blank, non-comment lines.  For comparison, the legacy
 7. `rtl8196e_hw_l2_setup()`: L2 table init, STP forwarding.
 8. `rtl8196e_hw_l2_add_cpu_entry()`: toCPU L2 entry for driver MAC.
 9. `rtl8196e_hw_l2_add_bcast_entry()`: broadcast flood + CPU entry.
-10. `rtl8196e_hw_start()`: CPUICR (`TXCMD | RXCMD | BURST_32 | MBUF_2048 |
-    EXCLUDE_CRC`), TRXRDY.
+10. `rtl8196e_hw_start()`: CPUICR (`TXCMD | RXCMD | BUSBURST_32WORDS |
+    MBUF_2048BYTES | EXCLUDE_CRC`), TRXRDY.
 11. `rtl8196e_hw_enable_irqs()`: CPUIIMR (`RX_DONE_IE_ALL | LINK_CHANGE_IE
     | PKTHDR_DESC_RUNOUT_IE_ALL`).  TX completion is **not** unmasked
     here (software reclaim).
@@ -192,7 +200,10 @@ driver is loaded.  All read/write at runtime (mode 0644).
 
 ## 14. Ethtool stats (`ethtool -S eth0`)
 
-7 driver-private stats (count returned by `get_sset_count(ETH_SS_STATS)`):
+24 driver-private stats (`RTL8196E_ETHTOOL_STATS_COUNT`, returned by
+`get_sset_count(ETH_SS_STATS)`), in three groups:
+
+L2 / first-TX debug (original set):
 
 - `rtl8196e_l2_check_ok` — successful L2 toCPU entry verifications
 - `rtl8196e_l2_check_fail` — failed L2 toCPU entry verifications
@@ -201,6 +212,23 @@ driver is loaded.  All read/write at runtime (mode 0644).
 - `rtl8196e_tx_dbg_vid` — VLAN ID used for first TX packet
 - `rtl8196e_tx_dbg_len` — length of first TX packet
 - `rtl8196e_tx_dbg_submit` — whether first TX submit succeeded
+
+TX kick coalescing (added with Track A, v3.4.1):
+
+- `rtl8196e_tx_kicks_total` / `_cold` / `_threshold` / `_drain` —
+  TXFD pulses, split by trigger (cold-start, threshold, NAPI drain)
+
+Ring anomaly counters (added with the driver 2.6 validators — must
+stay 0 in nominal flow):
+
+- `rtl8196e_rx_wild_pkthdr`, `rtl8196e_rx_wild_mbuf` — descriptor
+  pointers outside their pool
+- `rtl8196e_rx_bad_len`, `rtl8196e_rx_no_skb`, `rtl8196e_rx_alloc_fail`,
+  `rtl8196e_rx_rearm_badidx`, `rtl8196e_rx_mbuf_no_shadow` — RX drop
+  / rearm anomalies
+- `rtl8196e_tx_bad_args`, `rtl8196e_tx_bad_len`, `rtl8196e_tx_ring_full`,
+  `rtl8196e_tx_reclaim_no_skb`, `rtl8196e_tx_bad_pkthdr`,
+  `rtl8196e_tx_bad_mbuf` — TX submit / reclaim anomalies
 
 ## 15. Verification (v3.4.1, kernel 6.18.24, RLX4181 @ 380 MHz)
 
@@ -217,7 +245,7 @@ Functional checks:
 - Stable SSH session.
 - 0 driver TX/RX errors, 0 TCP retransmissions on the SoC side over a
   300 s stress.
-- `ethtool -S eth0` shows the 7 driver-private stats.
+- `ethtool -S eth0` shows the driver-private stats (see §14).
 - No warnings in dmesg.
 
 See `PERFORMANCE.md` for the full per-phase TX path decomposition,

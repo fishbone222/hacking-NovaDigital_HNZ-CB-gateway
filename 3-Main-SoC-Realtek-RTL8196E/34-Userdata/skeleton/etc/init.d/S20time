@@ -1,88 +1,54 @@
 #!/bin/sh
 #
-# S20time - Set timezone and synchronize time at boot using BusyBox ntpd
+# S20time - Set timezone and keep time synchronized using BusyBox ntpd
 #
-# This script is for embedded systems where /etc/TZ and /etc/ntp.conf
-# are symlinks into a writable overlay (e.g. from /userdata).
+# ntpd runs as a daemon (BusyBox ntpd self-daemonizes). With
+# CONFIG_FEATURE_NTPD_CONF it reads the "server" lines from /etc/ntp.conf,
+# retries forever — including DNS resolution failures — and steps then
+# disciplines the clock. That makes it robust against the two realities of
+# this board (issue #125):
+#   - no RTC: the clock starts at the epoch on every boot;
+#   - the gateway may boot without internet and get connectivity later —
+#     the daemon picks the time up whenever the network appears, and keeps
+#     the clock from drifting over month-long uptimes.
 #
-# Behavior:
-#   - If ENABLE_NTPD_DAEMON="N" (default), ntpd is run once with -q
-#   - If ENABLE_NTPD_DAEMON="O", ntpd runs continuously as a daemon
-#   - Internet connectivity is checked before attempting NTP sync
+# (Up to v3.9.0 this script ran a one-shot `ntpd -q` behind a ping gate and
+# exited for good when the network wasn't up yet at boot.)
 #
-# Configuration files:
-#   - /etc/TZ         → contains the timezone string (exported to TZ)
+# Configuration files (symlinks into the writable /userdata overlay):
+#   - /etc/TZ         → timezone string (exported to TZ)
 #       Example for Europe/Paris:
 #       echo "CET-1CEST,M3.5.0/2,M10.5.0/3" > /etc/TZ
-#   - /etc/ntp.conf   → list of NTP servers, one per line
+#   - /etc/ntp.conf   → NTP servers, one per line
 #       Example:
 #           server 0.pool.ntp.org
 #           server 1.pool.ntp.org
 #
-# J. Nilo - May 2025
-#
-### Configuration ###
-ENABLE_NTPD_DAEMON="N"      # "Y" = run ntpd continuously, "N" = run once with -q
-CONNECTIVITY_TEST="8.8.8.8" # IP to ping for connectivity check
-PING_COUNT="1"              # Number of ping attempts
-PING_TIMEOUT="2"            # Timeout in seconds
-RETRIES="3"                 # Retry count if first ping fails
-RETRY_DELAY="2"             # Seconds between retries
-######################
+# J. Nilo - May 2025, daemon-only June 2026 (#125)
 
 NTPCONF="/etc/ntp.conf"
 TZFILE="/etc/TZ"
 
-# Function to check for internet connectivity (with retries for early boot)
-check_connectivity() {
-    i=0
-    while [ "$i" -lt "$RETRIES" ]; do
-        if ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$CONNECTIVITY_TEST" >/dev/null 2>&1; then
-            return 0
-        fi
-        i=$((i + 1))
-        [ "$i" -lt "$RETRIES" ] && sleep "$RETRY_DELAY"
-    done
-    return 1
-}
-
 case "$1" in
 start)
-    # Set timezone if available (always do this regardless of connectivity)
+    # Set timezone if available (always, regardless of connectivity)
     if [ -f "$TZFILE" ]; then
         TZ=$(cat "$TZFILE")
         echo "🕓 Setting timezone to $TZ"
         export TZ="$TZ"
     fi
 
-    # Check for NTP config
     if [ ! -f "$NTPCONF" ]; then
         echo "⚠️ No $NTPCONF found, skipping NTP sync."
         exit 0
     fi
 
-    # Check for internet connectivity before attempting NTP
-    if ! check_connectivity; then
-        echo "📶 No internet connectivity detected, skipping NTP sync."
-        exit 0
-    fi
-
-    # Run ntpd only if we have internet connectivity
-    if [ "$ENABLE_NTPD_DAEMON" = "Y" ]; then
-        echo "🚀 Starting ntpd in daemon mode"
-        ntpd &
-    else
-        echo "🔁 Running ntpd -q (one-shot time sync)"
-        ntpd -q
-    fi
+    echo "🚀 Starting ntpd (daemon, syncs whenever internet is reachable)"
+    ntpd
     ;;
 stop)
-    if [ "$ENABLE_NTPD_DAEMON" = "Y" ]; then
-        echo "🔴 Stopping ntpd"
-        killall ntpd 2>/dev/null
-    else
-        echo "ℹ️ ntpd -q was used; nothing to stop"
-    fi
+    echo "🔴 Stopping ntpd"
+    killall ntpd 2>/dev/null
     ;;
 restart)
     "$0" stop

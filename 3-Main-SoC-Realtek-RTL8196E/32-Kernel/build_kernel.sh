@@ -19,6 +19,10 @@
 #   ./build_kernel.sh vmlinux        # build vmlinux only (no packaging)
 #   ./build_kernel.sh --help
 #
+#   BOARD=<name> selects the board devicetree built into the image
+#   (default: lidl). See files-6.18/arch/mips/boot/dts/realtek/Makefile
+#   for the add-a-board recipe.
+#
 # J. Nilo — February 2026, unified April 2026
 
 set -e
@@ -80,6 +84,20 @@ fi
 CVIMG_BURN_ADDR="0x00020000"
 SIGNATURE="cs6c"
 
+# ── Board selection ───────────────────────────────────────────────────────
+# One dtb per board (BUILTIN_DTB): BOARD maps to the matching entry of the
+# "Devicetree selection" Kconfig choice. The committed config selects the
+# Lidl board; other boards are flipped in by the .config fixup below.
+
+BOARD="${BOARD:-lidl}"
+case "$BOARD" in
+    lidl) BOARD_DTB_SYM="CONFIG_DTB_RTL8196E_GEN" ;;
+    *)
+        echo "ERROR: unknown BOARD '$BOARD' (known boards: lidl)" >&2
+        exit 1
+        ;;
+esac
+
 # ── Option parsing ────────────────────────────────────────────────────────
 
 DO_CLEAN=false
@@ -138,6 +156,7 @@ echo "Build dir:   $BUILD_DIR"
 echo "Patches dir: $(basename "$PATCHES_DIR")"
 echo "Files dir:   $(basename "$FILES_DIR")"
 echo "Config file: $(basename "$CONFIG_FILE")"
+echo "Board:       ${BOARD} (${BOARD_DTB_SYM})"
 echo ""
 
 # ── Clean ──────────────────────────────────────────────────────────────────
@@ -237,6 +256,17 @@ else
     fi
 
     [ "$NEED_OLDDEFCONFIG" = true ] && make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE olddefconfig && echo ""
+fi
+
+# Board dtb: make the .config match BOARD (exactly one CONFIG_DTB_RTL8196E_*
+# choice entry =y). No-op for the committed config + default BOARD=lidl.
+if ! grep -q "^${BOARD_DTB_SYM}=y" .config; then
+    echo "Fixing .config: selecting board dtb for BOARD=${BOARD}..."
+    sed -i -E 's/^(CONFIG_DTB_RTL8196E_[A-Z0-9_]+)=y$/# \1 is not set/' .config
+    sed -i "s/^# ${BOARD_DTB_SYM} is not set\$/${BOARD_DTB_SYM}=y/" .config
+    grep -q "^${BOARD_DTB_SYM}=y" .config || echo "${BOARD_DTB_SYM}=y" >> .config
+    make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE olddefconfig
+    echo ""
 fi
 
 # ── Special modes ──────────────────────────────────────────────────────────

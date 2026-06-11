@@ -111,7 +111,7 @@ This allows you to enable/disable applets (utilities), adjust features, and opti
 Dropbear is a lightweight SSH server designed for embedded systems. The build script supports version selection:
 
 ```bash
-# Default version (2025.88)
+# Default version (2025.89)
 ./build_dropbear.sh
 
 # Specific version

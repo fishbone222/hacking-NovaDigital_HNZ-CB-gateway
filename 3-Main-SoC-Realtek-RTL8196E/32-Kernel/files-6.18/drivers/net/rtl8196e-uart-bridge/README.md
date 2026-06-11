@@ -38,7 +38,7 @@ are live: writing flips the running bridge without reload.
 | `baud` | rw | UART baud. Applied live; take care matching EFR32 firmware |
 | `port` | rw, root | TCP listen port. Default `8888` |
 | `bind_addr` | rw, root | TCP bind address. Default `0.0.0.0`; set `127.0.0.1` for loopback-only |
-| `flow_control` | rw | 1 = CRTSCTS (normal), 0 = off (needed during EFR32 flash) |
+| `flow_control` | rw | `0`/`none` = off (needed during EFR32 flash), `1`/`hw` = CRTSCTS (default), `2`/`sw` = XON/XOFF handled by the bridge. Readback is always numeric |
 | `enable` | rw | 1 = arm the bridge, 0 = disarm. Boot default 0 |
 | `armed` | ro | 1 when both UART and listen socket are live |
 | `stats` | ro | `rx=... tx=... drops_nocli=... drops_err=... drops_tx=...` |
@@ -59,6 +59,39 @@ cat $SYSFS/armed      # 1
 The module loads at boot with `enable=0` and does nothing until something
 (typically the init script below) arms it. This avoids racing the 8250
 probe that creates `/dev/ttyS1`.
+
+## Device tree configuration
+
+Board-specific defaults can be described in an optional root node of the
+board DTS, looked up by compatible at driver init (the bridge is not a
+platform driver — no device binds to the node, and the unbound platform
+device it produces under `/sys/devices/platform/` is harmless):
+
+```dts
+radio-bridge {
+        compatible = "realtek,rtl8196e-uart-bridge";
+        nrst-gpios = <&gpio0 12 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+        flow-control = "hw";
+};
+```
+
+- `nrst-gpios` — gpio-rtl819x line wired to the EFR32 nRST pad. Only the
+  line number is consumed; the pulse path always claims the line
+  active-low + open-drain, because EFR32 RESETn is inherently both. The
+  DT cell flags should spell the same for the reader.
+- `flow-control` — `"hw"` (RTS/CTS), `"sw"` (XON/XOFF — for boards
+  without RTS/CTS wiring, paired with a software-flow-control radio
+  firmware such as NCP-UART-SW) or `"none"`, matching how the board
+  wires the EFR32 UART.
+
+Precedence is **DT < kernel command line < runtime sysfs writes**: the
+node only seeds the boot-time defaults of `nrst_gpio` and `flow_control`;
+an explicit `rtl8196e_uart_bridge.nrst_gpio=...` on the command line or a
+later sysfs write always wins. With no node (or no property) the
+compiled-in Lidl defaults apply — third-party DTS files may simply omit
+it. This is the mechanism that lets RTL8196E-twin ports (e.g. the Sengled
+G4, discussion #119) describe their radio wiring without patching the
+driver.
 
 ## Boot / runtime integration
 
@@ -91,17 +124,24 @@ for the full reference.
 
 ## Stats and observability
 
-`/sys/module/rtl8196e_uart_bridge/parameters/stats` tracks five counters:
+`/sys/module/rtl8196e_uart_bridge/parameters/stats` tracks eight counters:
 
 - `rx` — bytes forwarded UART → TCP (radio → host)
 - `tx` — bytes forwarded TCP → UART (host → radio)
 - `drops_nocli` — UART bytes dropped because no TCP client is connected
 - `drops_err` — UART bytes dropped because `kernel_sendmsg()` failed
 - `drops_tx` — TCP bytes dropped because the tty->write was short
+- `xoff` / `xon` — bare XOFF/XON bytes received from the radio
+  (`flow_control=sw` only; both stay 0 in hw/none modes)
+- `tx_pause_timeouts` — sw mode: a radio XOFF stayed unanswered for
+  more than 1 s and the bridge failed open
 
 Non-zero `drops_err` or `drops_tx` in steady state points to TCP
 backpressure or tty congestion, respectively. `drops_nocli` is normal
-any time Z2M (or whichever client) is not connected.
+any time Z2M (or whichever client) is not connected. In sw mode,
+`xoff`/`xon` incrementing with `drops_tx` staying 0 is the healthy
+signature; non-zero `tx_pause_timeouts` means the radio stopped
+draining its UART for over a second (stuck firmware, baud mismatch).
 
 Combined with the 8250 framing/overrun counters in
 `/proc/tty/driver/serial` you get a complete picture of both the
@@ -148,6 +188,10 @@ handles the EFR32 firmware flash without disarming it. It flips
 `flow_control` to 0 for the Gecko Bootloader Xmodem transfer and
 restores it to 1 afterwards. No manual teardown required.
 
+`flow_control=0` matters in **all** modes during a flash: Xmodem
+payloads contain raw 0x11/0x13 bytes, so leaving sw mode on would make
+the bridge eat them as XON/XOFF and corrupt the transfer.
+
 ## Security
 
 The bridge is a plaintext single-client TCP listener. Any host that can
@@ -163,13 +207,13 @@ and verification steps: [`SECURITY.md`](SECURITY.md).
 
 | File | Role |
 |---|---|
-| `rtl8196e_uart_bridge_main.c` | driver source (~1000 lines, single file) |
+| `rtl8196e_uart_bridge_main.c` | driver source (~1400 lines, single file) |
 | `Kconfig` / `Makefile` | in-tree build glue |
 | `README.md` | this file |
 | `DESIGN.md` | rationale + design notes (what was built and why) |
 | `SECURITY.md` | SSH-tunnel deployment and threat model |
 
-The driver header comment in `rtl8196e_uart_bridge_main.c:1-26` is the
-authoritative reference for the sysfs knobs and their runtime semantics
-— anything in this README that drifts from it should be treated as a
-documentation bug.
+The driver header comment at the top of `rtl8196e_uart_bridge_main.c`
+is the authoritative reference for the sysfs knobs and their runtime
+semantics — anything in this README that drifts from it should be
+treated as a documentation bug.

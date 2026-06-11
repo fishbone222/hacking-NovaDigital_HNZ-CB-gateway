@@ -12,6 +12,9 @@ The **Lidl Silvercrest Zigbee Gateway** is normally locked to the Tuya cloud.
 This project replaces the firmware and turns it into a **fully local, open smart home hub** — Zigbee coordinator, Thread Border Router, or Zigbee router:
 
 - **Zigbee coordinator** — use with Zigbee2MQTT or ZHA to pair and control any Zigbee device, no cloud
+- **Modern Zigbee stacks on a Series-1 chip** — run **EmberZNet 8.2** host-side
+  (cpcd + zigbeed), or hand the whole stack to Zigbee2MQTT's **ZigBee-on-Host**
+  (`zoh`) adapter — you are not stuck at the chip's last on-chip NCP release (7.5.1)
 - **Thread Border Router** — run otbr-agent natively on the gateway, compatible with Home Assistant
 - **Zigbee router** — extend your Zigbee mesh with a standalone 3.0 router
 - **SSH access** — full Linux shell on the gateway (BusyBox + Dropbear)
@@ -19,6 +22,14 @@ This project replaces the firmware and turns it into a **fully local, open smart
 
 The gateway has two chips: a **Realtek RTL8196E** running Linux, and a **Silabs EFR32MG1B**
 Zigbee/Thread radio connected via UART. This project provides firmware for both.
+
+And not only this gateway: the RTL8196E sits in many cheap Zigbee hubs of the
+same era, and since v3.10.0 everything board-specific (pins, wiring, memory
+size) lives in the device tree, with per-board kernel builds
+(`BOARD=<board> ./build_kernel.sh`) and a documented add-a-board recipe. If
+you own another RTL8196E-based gateway, porting this firmware is a recipe,
+not a fork — a community port to the **Sengled Smart Hub G4** is in progress
+([#119](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/discussions/119)).
 
 ______________________________________________________________________
 
@@ -92,8 +103,8 @@ Pick the firmware for your use case (alias = `bootloader`, `ncp`, `rcp`,
 | Choice | Firmware | Use with |
 |--------|----------|----------|
 | **NCP-UART-HW** | EmberZNet 7.5.1 (EZSP) | zigbee2mqtt, ZHA — simplest setup |
-| **RCP-UART-HW** | Multi-PAN RCP | zigbee2mqtt via cpcd + zigbeed |
-| **OT-RCP** | OpenThread RCP | otbr-agent (Thread Border Router) |
+| **RCP-UART-HW** | 802.15.4 RCP (CPC) | zigbee2mqtt with **EmberZNet 8.2** running host-side (cpcd + zigbeed) — the newest Zigbee stack on this Series-1 chip |
+| **OT-RCP** | OpenThread RCP | otbr-agent (Thread Border Router), or zigbee2mqtt's **ZigBee-on-Host** (`zoh` adapter) |
 
 ### Step 3: Connect Zigbee2MQTT
 

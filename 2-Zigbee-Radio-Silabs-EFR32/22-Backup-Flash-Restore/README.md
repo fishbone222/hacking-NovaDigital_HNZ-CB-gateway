@@ -224,14 +224,18 @@ Detected ApplicationType.GECKO_BOOTLOADER at 115200 baud
 
 ### The `flow_control` sysfs param Explained
 
-The Gecko Bootloader uses **software flow control** (XON/XOFF), while normal firmware operation (NCP, RCP) requires **hardware flow control** (RTS/CTS).
+The Gecko Bootloader runs its Xmodem path with **no flow control**, while
+normal firmware operation on the Lidl gateway (NCP, RCP) requires
+**hardware flow control** (RTS/CTS).
 
 | Bridge state | `flow_control` | Flow Control | When to Use |
 |--------------|----------------|--------------|-------------|
-| normal       | `1` (default)  | Hardware (RTS/CTS) | Normal operation (Z2M, ZHA) |
-| flash        | `0`            | Software (none)    | Flashing via bootloader |
+| normal       | `1` / `hw` (default) | Hardware (RTS/CTS) | Normal operation (Z2M, ZHA) on the Lidl board |
+| normal (sw)  | `2` / `sw`     | Software (XON/XOFF, handled by the bridge) | Boards without RTS/CTS wiring + NCP-UART-SW firmware (bridge v1.2, kernel 6.18) |
+| flash        | `0` / `none`   | None               | Flashing via bootloader (always 0 — Xmodem payloads contain raw XON/XOFF bytes) |
 
-Write the value to the sysfs knob — the bridge stays armed, TCP:8888 never drops:
+Readback of the knob is always numeric (`0`/`1`/`2`). Write the value to
+the sysfs knob — the bridge stays armed, TCP:8888 never drops:
 ```sh
 echo 0 > /sys/module/rtl8196e_uart_bridge/parameters/flow_control   # flash mode
 echo 1 > /sys/module/rtl8196e_uart_bridge/parameters/flow_control   # normal
@@ -251,7 +255,7 @@ Normal mode (hardware flow control):
                   → Xmodem responses blocked!
                   → Timeout → FailedToEnterBootloaderError
 
-With flow_control=0 (software flow control):
+With flow_control=0 (no flow control):
 ┌─────────────┐      TX/RX      ┌─────────────┐
 │ kernel      │<───────────────>│   EFR32     │
 │ UART bridge │   (no RTS/CTS)  │ (bootloader)│

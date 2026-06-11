@@ -12,7 +12,8 @@
  *   baud                   — UART baud rate (default 115200)                     [rw]
  *   port                   — TCP listen port (default 8888)                      [rw, root]
  *   bind_addr              — TCP bind address (default "0.0.0.0" = all)          [rw, root]
- *   flow_control           — hardware RTS/CTS (default 1; 0 for EFR32 flash)     [rw]
+ *   flow_control           — 0/none, 1/hw RTS-CTS (default), 2/sw XON-XOFF;
+ *                            set 0 for EFR32 flash                               [rw]
  *   enable                 — arm/disarm the bridge (default 0)                   [rw]
  *   armed                  — actual bridge state (read-only)                     [ro]
  *   stats                  — rx/tx/drop counters (read-only)                     [ro]
@@ -25,11 +26,17 @@
  * The init script S50uart_bridge sets the baud rate and writes
  * enable=1 once /dev/ttyS1 exists.
  *
+ * Defaults for nrst_gpio and flow_control can be described per-board in
+ * the device tree (optional /radio-bridge node, matched by compatible
+ * "realtek,rtl8196e-uart-bridge"). Precedence: DT < kernel command line
+ * < runtime sysfs writes. See bridge_seed_defaults_from_dt().
+ *
  * Rationale and architecture: see DESIGN.md in this directory.
  */
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/tty.h>
 #include <linux/tty_port.h>
 #include <linux/kthread.h>
@@ -52,7 +59,13 @@
 #include <net/tcp.h>
 
 #define DRV_NAME    "rtl8196e-uart-bridge"
-#define DRV_VERSION "1.1"
+#define DRV_VERSION "1.2"
+
+/* Software flow control bytes (flow_control=sw): sent bare by a radio
+ * firmware built for XON/XOFF (e.g. NCP-UART-SW); such firmware escapes
+ * data-plane 0x11/0x13, so bare occurrences are genuine flow control. */
+#define BRIDGE_XON  0x11
+#define BRIDGE_XOFF 0x13
 
 static DEFINE_MUTEX(bridge_lock);
 /*
@@ -94,12 +107,23 @@ static struct bridge_state {
 	 * the outgoing disarm would then no longer know about).
 	 */
 	bool                stopping_worker;
+	/*
+	 * Software flow control (flow_control=sw): set when the radio sent
+	 * a bare XOFF, cleared on XON. Written under bridge_lock (RX path,
+	 * param setter, arm / client transitions) with WRITE_ONCE; read
+	 * locklessly (READ_ONCE) by the worker's TX gate, which tolerates
+	 * staleness by design (bounded wait + fail-open).
+	 */
+	bool                sw_tx_paused;
 	/* stats */
 	u64 rx_bytes;      /* UART -> TCP forwarded */
 	u64 tx_bytes;      /* TCP -> UART forwarded */
 	u64 drops_nocli;   /* UART bytes dropped: no client connected */
 	u64 drops_err;     /* UART bytes dropped: sendmsg error */
 	u64 drops_tx;      /* TCP bytes dropped: tty->write short */
+	u64 xoff_events;   /* sw mode: bare XOFF received from radio */
+	u64 xon_events;    /* sw mode: bare XON received from radio */
+	u64 tx_pause_timeouts; /* sw mode: XOFF held > 1 s, failed open */
 } state;
 
 /* ----------------------------------------------------------- module params */
@@ -108,9 +132,27 @@ static char rtl_tty[64]       = "/dev/ttyS1";
 static int  rtl_baud          = 115200;
 static int  rtl_port          = 8888;
 static char rtl_bind[64]      = "0.0.0.0";
-static bool rtl_flow_control  = true;   /* CRTSCTS; 0 during EFR32 flash */
+
+/*
+ * Flow-control mode. Int-backed (sysfs readback prints 0/1/2, never a
+ * string): flash_efr32.sh writes literal 0/1 and string-compares the
+ * readback, so the historical numeric ABI must survive the tri-state.
+ */
+enum bridge_fc_mode {
+	BRIDGE_FC_NONE = 0,	/* no flow control (EFR32 flash / Xmodem) */
+	BRIDGE_FC_HW   = 1,	/* RTS/CTS — CRTSCTS termios -> 8250 AFE */
+	BRIDGE_FC_SW   = 2,	/* XON/XOFF from the radio, handled in-bridge */
+};
+static int  rtl_flow_control  = BRIDGE_FC_HW;
 static bool rtl_enable        = false;
 static int  rtl_nrst_gpio     = 12;     /* gpio-rtl819x line wired to EFR32 nRST */
+
+/* Set by the param setters (kernel cmdline or sysfs). The driver is
+ * built-in, so cmdline params are applied before late_initcall — these
+ * flags keep bridge_seed_defaults_from_dt() from clobbering an explicit
+ * user choice with the device-tree value. */
+static bool rtl_flow_control_set_by_user;
+static bool rtl_nrst_gpio_set_by_user;
 
 /* Status LED control: fire an LED trigger when a TCP client is connected,
  * clear it on disconnect. Mirrors the pre-v3.0 serialgateway behaviour
@@ -151,18 +193,19 @@ static int  bridge_reconfig_listen_locked(void);
  *
  * Pattern lifted from drivers/tty/serdev/serdev-ttyport.c.
  */
-static size_t bridge_port_receive_buf(struct tty_port *port, const u8 *cp,
-				      const u8 *fp, size_t count)
+/* Must be called with bridge_lock held. Forwards one chunk to the TCP
+ * client with the historical drop-don't-block semantics. */
+static void bridge_send_to_client_locked(const u8 *cp, size_t count)
 {
 	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
 	struct kvec vec = { .iov_base = (void *)cp, .iov_len = count };
 	int ret;
 
-	mutex_lock(&bridge_lock);
+	if (!count)
+		return;
 	if (!state.client_sock) {
 		state.drops_nocli += count;
-		mutex_unlock(&bridge_lock);
-		return count;
+		return;
 	}
 
 	ret = kernel_sendmsg(state.client_sock, &msg, &vec, 1, count);
@@ -197,6 +240,44 @@ static size_t bridge_port_receive_buf(struct tty_port *port, const u8 *cp,
 		pr_warn_ratelimited(DRV_NAME ": client sendmsg=%d, dropping %zu bytes\n",
 				    ret, count);
 	}
+}
+
+/* Must be called with bridge_lock held. sw mode only: scan the chunk for
+ * bare XON/XOFF from the radio, gate the TCP->UART worker accordingly,
+ * strip the control bytes from the TCP-bound stream and forward the data
+ * segments in between unchanged. No ldisc is attached (client_ops
+ * bypass), so termios IXON/IXOFF could not do this for us. */
+static void bridge_receive_sw_locked(const u8 *cp, size_t count)
+{
+	size_t seg = 0, i;
+
+	for (i = 0; i < count; i++) {
+		if (cp[i] != BRIDGE_XON && cp[i] != BRIDGE_XOFF)
+			continue;
+
+		bridge_send_to_client_locked(cp + seg, i - seg);
+		seg = i + 1;
+		if (cp[i] == BRIDGE_XOFF) {
+			WRITE_ONCE(state.sw_tx_paused, true);
+			state.xoff_events++;
+		} else {
+			WRITE_ONCE(state.sw_tx_paused, false);
+			state.xon_events++;
+		}
+	}
+	bridge_send_to_client_locked(cp + seg, count - seg);
+}
+
+static size_t bridge_port_receive_buf(struct tty_port *port, const u8 *cp,
+				      const u8 *fp, size_t count)
+{
+	mutex_lock(&bridge_lock);
+	/* hw/none: single full-chunk send, byte-for-byte the v1.1 path.
+	 * The scan branch costs nothing unless sw mode is selected. */
+	if (rtl_flow_control == BRIDGE_FC_SW)
+		bridge_receive_sw_locked(cp, count);
+	else
+		bridge_send_to_client_locked(cp, count);
 	mutex_unlock(&bridge_lock);
 	return count;
 }
@@ -317,6 +398,9 @@ static int bridge_worker_thread(void *data)
 			}
 		}
 		state.client_sock = newsock;
+		/* Fresh client, fresh session: forget any XOFF left over
+		 * from the previous one. */
+		WRITE_ONCE(state.sw_tx_paused, false);
 		brightness = clamp(rtl_status_led_brightness, 0, 255);
 		mutex_unlock(&bridge_lock);
 
@@ -351,6 +435,32 @@ static int bridge_worker_thread(void *data)
 			if (n <= 0) {
 				last_recv = n;
 				break; /* disconnect, error, or shutdown */
+			}
+
+			/* sw flow control: the radio said XOFF — hold this
+			 * chunk until XON or a bounded fail-open timeout.
+			 * Lockless READ_ONCE (see sw_tx_paused); the wait is
+			 * always bounded so the disarm path's synchronous
+			 * kthread_stop() can never hang on it.
+			 */
+			if (READ_ONCE(rtl_flow_control) == BRIDGE_FC_SW &&
+			    READ_ONCE(state.sw_tx_paused)) {
+				unsigned long deadline = jiffies + HZ;
+
+				while (READ_ONCE(state.sw_tx_paused) &&
+				       time_before(jiffies, deadline) &&
+				       !kthread_should_stop())
+					usleep_range(1000, 2000);
+
+				if (READ_ONCE(state.sw_tx_paused) &&
+				    !kthread_should_stop()) {
+					mutex_lock(&bridge_lock);
+					WRITE_ONCE(state.sw_tx_paused, false);
+					state.tx_pause_timeouts++;
+					mutex_unlock(&bridge_lock);
+					pr_warn_ratelimited(DRV_NAME
+						": radio XOFF held > 1 s, failing open\n");
+				}
 			}
 
 			/* Inject into the tty TX path via a bounded retry
@@ -397,6 +507,8 @@ static int bridge_worker_thread(void *data)
 		 * accept, so flashing off here briefly is harmless. */
 		led_trigger_event(bridge_led_trig, 0);
 		mutex_lock(&bridge_lock);
+		/* Session over: a trailing XOFF must not gate the next one. */
+		WRITE_ONCE(state.sw_tx_paused, false);
 		if (state.client_sock == newsock) {
 			state.client_sock = NULL;
 			mutex_unlock(&bridge_lock);
@@ -461,14 +573,18 @@ static int bridge_apply_termios(struct tty_struct *tty, int baud)
 	int ret;
 
 	k = tty->termios;
-	/* Raw 8N1, carrier-detect ignored; RTS/CTS per rtl_flow_control. */
+	/* Raw 8N1, carrier-detect ignored; RTS/CTS only in hw mode.
+	 * IXON/IXOFF/IXANY are always cleared: no ldisc is attached
+	 * (client_ops bypass), so termios software flow control would be
+	 * inert anyway — in sw mode the bridge itself handles the radio's
+	 * XON/XOFF (see bridge_receive_sw_locked). */
 	k.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP |
-		       INLCR | IGNCR | ICRNL | IXON);
+		       INLCR | IGNCR | ICRNL | IXON | IXOFF | IXANY);
 	k.c_oflag &= ~OPOST;
 	k.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
 	k.c_cflag &= ~(CSIZE | PARENB | CBAUD | CRTSCTS);
 	k.c_cflag |= CS8 | CLOCAL | CREAD;
-	if (rtl_flow_control)
+	if (rtl_flow_control == BRIDGE_FC_HW)
 		k.c_cflag |= CRTSCTS;
 	tty_termios_encode_baud_rate(&k, baud, baud);
 
@@ -605,6 +721,10 @@ static int bridge_arm_locked(void)
 	state.drops_nocli = 0;
 	state.drops_err = 0;
 	state.drops_tx = 0;
+	state.xoff_events = 0;
+	state.xon_events = 0;
+	state.tx_pause_timeouts = 0;
+	WRITE_ONCE(state.sw_tx_paused, false);
 
 	th = kthread_run(bridge_worker_thread, NULL, DRV_NAME "-worker");
 	if (IS_ERR(th)) {
@@ -646,7 +766,7 @@ static void bridge_disarm_locked(void)
 	struct task_struct *th;
 	struct tty_struct *tty;
 	struct socket *ls, *cs;
-	u64 rx, tx, dn, de, dtx;
+	u64 rx, tx, dn, de, dtx, xo, xn, tpt;
 
 	if (!state.armed)
 		return;
@@ -683,11 +803,15 @@ static void bridge_disarm_locked(void)
 	/* Bridge is going down. Clear the STATUS LED unconditionally —
 	 * idempotent if no client was connected. */
 	led_trigger_event(bridge_led_trig, 0);
+	WRITE_ONCE(state.sw_tx_paused, false);
 	rx = state.rx_bytes;
 	tx = state.tx_bytes;
 	dn = state.drops_nocli;
 	de = state.drops_err;
 	dtx = state.drops_tx;
+	xo = state.xoff_events;
+	xn = state.xon_events;
+	tpt = state.tx_pause_timeouts;
 
 	/* Drop the mutex before blocking on socket shutdown / kthread_stop
 	 * so we don't deadlock with receive_buf (which grabs the same lock).
@@ -745,8 +869,8 @@ static void bridge_disarm_locked(void)
 		tty_kclose(tty);
 	}
 
-	pr_info(DRV_NAME ": disarmed (rx=%llu tx=%llu drops_nocli=%llu drops_err=%llu drops_tx=%llu)\n",
-		rx, tx, dn, de, dtx);
+	pr_info(DRV_NAME ": disarmed (rx=%llu tx=%llu drops_nocli=%llu drops_err=%llu drops_tx=%llu xoff=%llu xon=%llu tx_pause_timeouts=%llu)\n",
+		rx, tx, dn, de, dtx, xo, xn, tpt);
 
 	/* Clear the rest of the state under the lock so subsequent sysfs
 	 * readers / receive_buf see a consistent disarmed state.
@@ -1080,33 +1204,73 @@ static const struct kernel_param_ops bind_ops = {
 };
 
 /*
- * flow_control: toggle CRTSCTS at runtime without disarming the bridge.
+ * flow_control: switch the flow-control mode at runtime without
+ * disarming the bridge.
+ *
+ * Accepted spellings: 0/1/2, "none"/"hw"/"sw" (lowercase), plus the
+ * legacy kstrtobool forms (y/n/on/off — flash_efr32.sh and older docs
+ * write 0/1). Readback always prints the numeric value: flash_efr32.sh
+ * string-compares it against '0'/'1', so this ABI must stay numeric.
  *
  * Needed by flash_efr32.sh: the Gecko bootloader Xmodem path requires
- * RTS/CTS off.  Write 0 before flashing and 1 after.  Re-applies termios
- * through bridge_reconfig_baud_locked() (which re-calls
- * bridge_apply_termios() with the updated rtl_flow_control value).
+ * all flow control off (Xmodem payloads contain raw 0x11/0x13, so sw
+ * mode must be off too).  Write 0 before flashing and restore after.
+ * Re-applies termios through bridge_reconfig_baud_locked() (which
+ * re-calls bridge_apply_termios() with the updated rtl_flow_control).
  */
+static int bridge_parse_fc(const char *val, int *out)
+{
+	bool b;
+	int v;
+
+	if (!kstrtoint(val, 0, &v)) {
+		if (v < BRIDGE_FC_NONE || v > BRIDGE_FC_SW)
+			return -EINVAL;
+		*out = v;
+		return 0;
+	}
+	if (sysfs_streq(val, "none")) {
+		*out = BRIDGE_FC_NONE;
+		return 0;
+	}
+	if (sysfs_streq(val, "hw")) {
+		*out = BRIDGE_FC_HW;
+		return 0;
+	}
+	if (sysfs_streq(val, "sw")) {
+		*out = BRIDGE_FC_SW;
+		return 0;
+	}
+	if (!kstrtobool(val, &b)) {
+		*out = b ? BRIDGE_FC_HW : BRIDGE_FC_NONE;
+		return 0;
+	}
+	return -EINVAL;
+}
+
 static int param_set_flow_control(const char *val, const struct kernel_param *kp)
 {
-	bool new_fc;
-	int ret;
+	int new_fc, ret;
 
-	ret = kstrtobool(val, &new_fc);
+	ret = bridge_parse_fc(val, &new_fc);
 	if (ret)
 		return ret;
 
 	mutex_lock(&bridge_lock);
+	rtl_flow_control_set_by_user = true;
 	if (new_fc != rtl_flow_control) {
-		bool old_fc = rtl_flow_control;
+		int old_fc = rtl_flow_control;
 
 		rtl_flow_control = new_fc;
+		/* Mode switch invalidates any pending XOFF gate. */
+		WRITE_ONCE(state.sw_tx_paused, false);
 		if (state.armed) {
 			ret = bridge_reconfig_baud_locked();
 			if (ret) {
 				pr_warn(DRV_NAME ": flow_control=%d failed (%d), rolling back to %d\n",
 					new_fc, ret, old_fc);
 				rtl_flow_control = old_fc;
+				WRITE_ONCE(state.sw_tx_paused, false);
 				bridge_reconfig_baud_locked();
 			}
 		}
@@ -1117,12 +1281,12 @@ static int param_set_flow_control(const char *val, const struct kernel_param *kp
 
 static int param_get_flow_control(char *buffer, const struct kernel_param *kp)
 {
-	bool v;
+	int v;
 
 	mutex_lock(&bridge_lock);
 	v = rtl_flow_control;
 	mutex_unlock(&bridge_lock);
-	return scnprintf(buffer, PAGE_SIZE, "%d\n", v ? 1 : 0);
+	return scnprintf(buffer, PAGE_SIZE, "%d\n", v);
 }
 
 static const struct kernel_param_ops flow_control_ops = {
@@ -1228,6 +1392,7 @@ static int param_set_nrst_gpio(const char *val, const struct kernel_param *kp)
 
 	mutex_lock(&nrst_pulse_lock);
 	rtl_nrst_gpio = new_v;
+	rtl_nrst_gpio_set_by_user = true;
 	mutex_unlock(&nrst_pulse_lock);
 	return 0;
 }
@@ -1268,10 +1433,14 @@ static int param_get_stats(char *buffer, const struct kernel_param *kp)
 	int n;
 
 	mutex_lock(&bridge_lock);
+	/* Append-only: existing fields keep their order so ad-hoc parsers
+	 * of the v1.x output keep working. */
 	n = scnprintf(buffer, PAGE_SIZE,
-		      "rx=%llu tx=%llu drops_nocli=%llu drops_err=%llu drops_tx=%llu\n",
+		      "rx=%llu tx=%llu drops_nocli=%llu drops_err=%llu drops_tx=%llu xoff=%llu xon=%llu tx_pause_timeouts=%llu\n",
 		      state.rx_bytes, state.tx_bytes,
-		      state.drops_nocli, state.drops_err, state.drops_tx);
+		      state.drops_nocli, state.drops_err, state.drops_tx,
+		      state.xoff_events, state.xon_events,
+		      state.tx_pause_timeouts);
 	mutex_unlock(&bridge_lock);
 	return n;
 }
@@ -1328,7 +1497,8 @@ MODULE_PARM_DESC(port,      "TCP listen port (default 8888)");
 module_param_cb(bind_addr, &bind_ops,   NULL, 0600);
 MODULE_PARM_DESC(bind_addr, "TCP bind address (default 0.0.0.0 = all interfaces)");
 module_param_cb(flow_control, &flow_control_ops, NULL, 0644);
-MODULE_PARM_DESC(flow_control, "Hardware RTS/CTS (default 1; set 0 for EFR32 flash)");
+MODULE_PARM_DESC(flow_control,
+	"0/none, 1/hw=RTS-CTS (default), 2/sw=XON-XOFF; set 0 for EFR32 flash");
 module_param_cb(enable,    &enable_ops, NULL, 0644);
 MODULE_PARM_DESC(enable,    "1=arm bridge, 0=disarm (default 0, arm via init script)");
 module_param_cb(armed,     &armed_ops,  NULL, 0444);
@@ -1350,8 +1520,69 @@ MODULE_PARM_DESC(status_led_brightness,
 
 /* ------------------------------------------------------------------ init */
 
+/*
+ * Seed nrst_gpio and flow_control defaults from an optional board node:
+ *
+ *   radio-bridge {
+ *           compatible = "realtek,rtl8196e-uart-bridge";
+ *           nrst-gpios = <&gpio0 12 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+ *           flow-control = "hw";
+ *   };
+ *
+ * Only the line number of nrst-gpios is consumed — the pulse path keeps
+ * its hardcoded ACTIVE_LOW | OPEN_DRAIN lookup flags because EFR32 RESETn
+ * is inherently open-drain active-low on any board; the DT cell flags
+ * document the same fact for the reader. The node is optional: absent
+ * node (or absent property) keeps the compiled-in Lidl defaults.
+ * Explicit cmdline/sysfs writes win over DT (see *_set_by_user).
+ */
+static void __init bridge_seed_defaults_from_dt(void)
+{
+	struct of_phandle_args args;
+	struct device_node *np;
+	const char *fc;
+
+	np = of_find_compatible_node(NULL, NULL, "realtek,rtl8196e-uart-bridge");
+	if (!np)
+		return;
+
+	if (!rtl_nrst_gpio_set_by_user &&
+	    !of_parse_phandle_with_args(np, "nrst-gpios", "#gpio-cells", 0,
+					&args)) {
+		if (args.args_count >= 1 && args.args[0] <= 31) {
+			mutex_lock(&nrst_pulse_lock);
+			rtl_nrst_gpio = args.args[0];
+			mutex_unlock(&nrst_pulse_lock);
+		} else {
+			pr_warn(DRV_NAME ": DT nrst-gpios out of range, keeping %d\n",
+				rtl_nrst_gpio);
+		}
+		of_node_put(args.np);
+	}
+
+	if (!rtl_flow_control_set_by_user &&
+	    !of_property_read_string(np, "flow-control", &fc)) {
+		if (!strcmp(fc, "hw")) {
+			rtl_flow_control = BRIDGE_FC_HW;
+		} else if (!strcmp(fc, "sw")) {
+			rtl_flow_control = BRIDGE_FC_SW;
+		} else if (!strcmp(fc, "none")) {
+			rtl_flow_control = BRIDGE_FC_NONE;
+		} else {
+			pr_warn(DRV_NAME ": DT flow-control \"%s\" unknown (hw/sw/none), keeping %d\n",
+				fc, rtl_flow_control);
+		}
+	}
+
+	pr_info(DRV_NAME ": DT defaults: nrst_gpio=%d flow_control=%d\n",
+		rtl_nrst_gpio, rtl_flow_control);
+	of_node_put(np);
+}
+
 static int __init rtl8196e_uart_bridge_init(void)
 {
+	bridge_seed_defaults_from_dt();
+
 	/* Register the "client connected" LED trigger so userspace can bind
 	 * it to an actual LED (/sys/class/leds/<led>/trigger). The trigger
 	 * persists for the lifetime of the kernel (built-in driver, no

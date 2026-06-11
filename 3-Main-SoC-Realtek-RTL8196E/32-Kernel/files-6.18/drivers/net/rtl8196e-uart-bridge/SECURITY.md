@@ -31,6 +31,14 @@ end-to-end cryptographic authentication and encryption provide real
 protection — which is exactly what SSH offers for free on this
 platform.
 
+One protocol-level note on `flow_control=sw` (v1.2): in that mode the
+bridge consumes bare 0x11/0x13 bytes from the *radio→host* stream as
+XON/XOFF instead of forwarding them. This is byte-transparent for a
+software-flow-control radio firmware (it escapes data-plane 0x11/0x13
+by design), but it is one more reason `flash_efr32.sh` must drop
+`flow_control` to 0 during a flash — Xmodem payloads carry raw
+0x11/0x13. The host→radio direction is never filtered.
+
 ---
 
 ## Architecture
@@ -356,5 +364,5 @@ For deep diagnostics, run the tunnel with `-vv` on the host and watch
   connections between host and gateway on port 22. Only the bytes
   flowing are confidential.
 
-This document complements `AUDIT.md` (kernel-driver audit) and lives
+This document complements `DESIGN.md` (driver rationale) and lives
 alongside the driver source for easy discovery by future maintainers.

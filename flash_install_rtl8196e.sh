@@ -21,15 +21,22 @@
 #   is still required for serial console guidance.
 #
 # The flash step is the same regardless of firmware version — no version parsing.
-# Auto-flash vs manual FLW is decided behaviourally, in two cheap observations:
+# On the boothold (auto) path no classification is needed at all: we got there
+# by running `boothold` on a custom firmware, so the bootloader is a custom
+# V2.x with auto-flash by construction — upload, then confirm the write.
+# On the manual / first-flash path, auto-flash vs manual FLW is decided
+# behaviourally, in two cheap observations:
 #   - Pre-upload ICMP: Tuya / pre-ICMP stock bootloaders never answer ping and
-#     have no auto-flash → go straight to guided FLW (no wait). Every custom
-#     bootloader answers ping, so this alone can't tell auto-flash from not.
+#     have no auto-flash → go straight to guided FLW (no wait).
 #   - Post-upload ICMP: a bootloader WITH auto-flash starts writing 16 MiB the
 #     instant the upload lands and, being single-threaded, stops answering ping
 #     for the duration; one WITHOUT keeps answering at its idle prompt. So "ping
-#     was up and goes silent" = auto-flash in progress → wait for the UDP:9999 OK.
-#     "Stays up" = no auto-flash → guided FLW. Decided in seconds, not minutes.
+#     was up and goes silent" = auto-flash in progress. "Stays up" = no
+#     auto-flash → guided FLW. Decided in seconds, not minutes.
+# The write is then confirmed on two independent channels (see
+# confirm_autoflash): the bootloader's UDP:9999 OK/FAIL notification, and —
+# when the gateway's post-flash address is known for certain — SSH coming
+# back up at that address, which can only mean the new firmware booted.
 #
 # Prerequisites:
 #   - Ethernet cable between host and gateway
@@ -203,6 +210,22 @@ require_boot_l2() {
         echo "Then re-run this script. Remove the address afterwards with 'ip addr del'." >&2
         exit 1
     fi
+}
+
+# Probe the bootloader's TFTP server with a 1-byte WRQ (PUT). The bootloader
+# ACKs a WRQ immediately; anything else — a Linux still shutting down, a
+# proxy-ARP router answering for an address that is not up, no device at all —
+# gives no UDP response and tftp-hpa hangs until timeout kills it (rc 124).
+# Use PUT, not GET: the bootloader silently drops RRQ (error on serial only).
+# The 1-byte payload is harmless: the bootloader receives it, fails the image
+# signature check, and discards it (one_tftp_lock is released on completion).
+probe_tftp_wrq() {
+    local probe_file rc=0
+    probe_file=$(mktemp)
+    echo -n X > "$probe_file"
+    timeout 3 tftp -m binary "$BOOT_IP" -c put "$probe_file" >/dev/null 2>&1 || rc=$?
+    rm -f "$probe_file"
+    [ "$rc" -ne 124 ]
 }
 
 # Build fullflash.bin, sanity-check it, and ask the final confirmation.
@@ -471,22 +494,38 @@ EOF
         tries=$((tries + 1))
     done
 
-    # Phase 2: wait for bootloader ARP
+    # Phase 2: wait for the bootloader. ARP alone is not enough: the dying
+    # Linux keeps answering ARP for a few seconds after SSH goes down (ARP
+    # flux), and a proxy-ARP router can answer for an address that is not up
+    # at all. Both produced false "Bootloader detected" (discussion #115):
+    # the ICMP classification then ran against a rebooting box and wrongly
+    # picked the manual path, or the 16 MiB upload ran against nothing and
+    # sat in a 5-minute timeout. Require what the flash actually needs — a
+    # TFTP server that ACKs a WRQ.
     echo "Waiting for bootloader at ${BOOT_IP}..."
     tries=0
-    while [ $tries -lt 30 ]; do
+    BOOTLOADER_UP=""
+    while [ $tries -lt 45 ]; do
         ip neigh del "$BOOT_IP" dev "$IFACE" 2>/dev/null || true
         bash -c "echo -n X >/dev/udp/$BOOT_IP/69" 2>/dev/null || true
         sleep 1
         nei="$(ip neigh show "$BOOT_IP" dev "$IFACE" 2>/dev/null || true)"
-        if echo "$nei" | grep -Eqi 'lladdr [0-9a-f]{2}(:[0-9a-f]{2}){5}'; then
+        if echo "$nei" | grep -Eqi 'lladdr [0-9a-f]{2}(:[0-9a-f]{2}){5}' \
+           && probe_tftp_wrq; then
+            BOOTLOADER_UP=1
             break
         fi
         tries=$((tries + 1))
     done
 
-    if [ $tries -ge 30 ]; then
-        echo "Error: bootloader not detected after boothold." >&2
+    if [ -z "$BOOTLOADER_UP" ]; then
+        echo "Error: bootloader not detected after boothold (no TFTP server at ${BOOT_IP})." >&2
+        echo "" >&2
+        echo "Note: pre-V2.7 bootloaders ignore the boothold IP handoff and come up at" >&2
+        echo "the default 192.168.1.6 — if you used --boot-ip, retry from a host on" >&2
+        echo "that subnet without it." >&2
+        echo "Nothing was written: a power cycle returns the gateway to its current" >&2
+        echo "firmware." >&2
         exit 1
     fi
 else
@@ -514,15 +553,7 @@ else
     fi
 
     # ARP resolved — but is it really bootloader? Probe TFTP to confirm.
-    # Use PUT (not GET): bootloader ACKs a WRQ immediately, but silently drops
-    # RRQ (prints error on serial only, no UDP response → tftp-hpa hangs).
-    # timeout returns 124 when no TFTP server responds; 0 when bootloader ACKs.
-    probe_file=$(mktemp)
-    echo -n X > "$probe_file"
-    probe_rc=0
-    timeout 3 tftp -m binary "$BOOT_IP" -c put "$probe_file" >/dev/null 2>&1 || probe_rc=$?
-    rm -f "$probe_file"
-    if [ $probe_rc -eq 124 ]; then
+    if ! probe_tftp_wrq; then
         echo "Device at ${BOOT_IP} is not in bootloader mode (no TFTP server)."
         echo "If the gateway is running Linux, run:  $0 <LINUX_IP>"
         exit 1
@@ -627,23 +658,47 @@ manual_flw_guidance() {
     echo "(or do a hard reset / power cycle)."
 }
 
-# Listen for the bootloader's UDP:9999 OK/FAIL notification, echoing the result
-# (empty on timeout or when nc is absent). The flash write takes ~2 min, so the
-# ceiling is 180s — but the listener breaks the instant data arrives, so a real
-# auto-flash is never penalised by the full timeout.
-wait_for_autoflash_result() {
-    command -v nc >/dev/null 2>&1 || return 0
-    local notify_file nc_pid
-    notify_file=$(mktemp)
-    (timeout 180 nc -u -l -p 9999 > "$notify_file" 2>/dev/null) &
-    nc_pid=$!
-    while kill -0 "$nc_pid" 2>/dev/null; do
-        [ -s "$notify_file" ] && { kill "$nc_pid" 2>/dev/null; break; }
-        sleep 0.5
+# Confirm the auto-flash write on two independent channels, echoing "OK",
+# "SSH" (gateway back up on SSH — implies the write succeeded), "FAIL", or ""
+# on timeout:
+#   - UDP:9999 — the bootloader's OK/FAIL notification, sent to the TFTP
+#     client when the write ends. Instant, but easily lost: host firewalls
+#     drop unsolicited inbound UDP, nc may be absent, and some netcat
+#     variants reject `-l -p`. Never the only channel (discussion #115:
+#     a successful flash was reported as "No auto-flash confirmation").
+#   - SSH return — after writing, the bootloader reboots the box into the
+#     NEW firmware. Nothing answers at the gateway's address during the
+#     write, so SSH coming up there can only mean the flash succeeded.
+#     Only polled when the post-flash address is known for certain
+#     (SSH_POLL_IP, see below) — never against a guessed default.
+# The write takes ~2 min and the reboot to SSH ~40 s more, hence the 270 s
+# ceiling; both channels break out the moment they conclude.
+confirm_autoflash() {
+    local deadline result="" notify_file="" nc_pid=""
+    deadline=$(( $(date +%s) + 270 ))
+    if command -v nc >/dev/null 2>&1; then
+        notify_file=$(mktemp)
+        (timeout 270 nc -u -l -p 9999 > "$notify_file" 2>/dev/null) &
+        nc_pid=$!
+    fi
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ -n "$notify_file" ] && [ -s "$notify_file" ]; then
+            result="$(tr -d '\0' < "$notify_file" 2>/dev/null || true)"
+            break
+        fi
+        if [ -n "$SSH_POLL_IP" ] \
+           && timeout 2 bash -c "echo >/dev/tcp/$SSH_POLL_IP/22" 2>/dev/null; then
+            result="SSH"
+            break
+        fi
+        sleep 2
     done
-    wait "$nc_pid" 2>/dev/null || true
-    tr -d '\0' < "$notify_file" 2>/dev/null || true
-    rm -f "$notify_file"
+    if [ -n "$nc_pid" ]; then
+        kill "$nc_pid" 2>/dev/null || true
+        wait "$nc_pid" 2>/dev/null || true
+    fi
+    [ -n "$notify_file" ] && rm -f "$notify_file"
+    echo "$result"
 }
 
 # Behavioural auto-flash probe (call right after the upload). An auto-flash
@@ -676,24 +731,59 @@ print_complete() {
     echo "SSH: root@${GW_HINT_IP}:22 (no password) in ~30 seconds."
 }
 
+# Post-flash SSH probe target for confirm_autoflash — only set when the
+# gateway's address after the flash is known for certain: the upgrade path
+# (the box held that address minutes ago and its config is preserved), or a
+# static IP explicitly chosen for this install. Never a guessed default —
+# an unrelated device answering SSH there would fake a success.
+SSH_POLL_IP=""
+if [ -n "$LINUX_RUNNING" ]; then
+    SSH_POLL_IP="${LINUX_IP}"
+elif [ "${NET_MODE:-}" = "static" ] && [ -n "${IPADDR:-}" ]; then
+    SSH_POLL_IP="$IPADDR"
+fi
+
+# Run the confirmation and report. On OK/SSH the flash is proven done; on
+# FAIL or timeout, fall back to the guided manual path (which itself starts
+# by telling the user how to re-check for a quiet success).
+confirm_and_report() {
+    local result
+    result="$(confirm_autoflash)"
+    case "$result" in
+    OK)
+        echo ""
+        echo "Flash write succeeded. The gateway will reboot automatically."
+        ;;
+    SSH)
+        echo ""
+        echo "Gateway is back up on SSH — flash write succeeded."
+        ;;
+    FAIL)
+        echo "Auto-flash reported FAIL. Falling back to manual flash."
+        manual_flw_guidance
+        ;;
+    *)
+        echo "No auto-flash confirmation. Falling back to manual flash."
+        manual_flw_guidance
+        ;;
+    esac
+    print_complete
+}
+
 # Pre-upload capability probe (see note at top of file): Tuya / pre-ICMP stock
-# bootloaders never answer ping and have no auto-flash.
-#
-# Poll instead of a single probe: the custom V2.5 bootloader can take a second
-# or two after ARP resolves before its ICMP responder is up. Now that the image
-# is built *before* boothold, this runs immediately after bootloader detection
-# with no multi-minute build to mask that settle window — a single ping flaked
-# to "no" and wrongly picked the manual path even though auto-flash worked
-# (issue: gateway re-flashed fine but the script printed manual FLW guidance).
-# A genuine Tuya / pre-v2 bootloader never answers, so the window is exhausted
-# (~10 s, only on the already-manual path) and we correctly fall through.
+# bootloaders never answer ping and have no auto-flash. Only meaningful on the
+# manual / first-flash path — on the boothold path the bootloader is custom by
+# construction (V2.1–V2.4 answer no ICMP yet auto-flash fine), so classifying
+# it "Tuya" from a missed ping is exactly the #115 false negative.
 PING_BEFORE=no
-for _i in $(seq 1 10); do
-    if ping -c 1 -W 1 "$BOOT_IP" >/dev/null 2>&1; then
-        PING_BEFORE=yes
-        break
-    fi
-done
+if [ "$ENTRY" != "auto" ]; then
+    for _i in $(seq 1 10); do
+        if ping -c 1 -W 1 "$BOOT_IP" >/dev/null 2>&1; then
+            PING_BEFORE=yes
+            break
+        fi
+    done
+fi
 
 echo ""
 echo "Uploading fullflash.bin via TFTP (16 MiB)..."
@@ -701,30 +791,26 @@ cd "$SCRIPT_DIR"
 out=$(timeout 300 tftp -m binary "$BOOT_IP" -c put fullflash.bin 2>&1) || true
 if check_tftp_error "$out"; then
     echo "Error: TFTP transfer failed: $out" >&2
+    echo "" >&2
+    echo "Nothing was written. The gateway is still at the bootloader prompt at" >&2
+    echo "${BOOT_IP} — re-run this script to retry the upload, or power-cycle the" >&2
+    echo "gateway to boot its existing firmware." >&2
     exit 1
 fi
 echo "Upload OK."
 
-if [ "$PING_BEFORE" = "no" ]; then
+if [ "$ENTRY" = "auto" ]; then
+    # Boothold path: the bootloader ACKed the WRQ probe and auto-flashes by
+    # construction. No ICMP classification — go straight to confirmation.
+    echo "Auto-flash in progress (bootloader is writing flash). Waiting for confirmation..."
+    confirm_and_report
+elif [ "$PING_BEFORE" = "no" ]; then
     echo "Bootloader does not answer ICMP (Tuya / pre-v2) — manual flash required."
     manual_flw_guidance
     print_complete
 elif autoflash_in_progress; then
     echo "Auto-flash detected (bootloader is writing flash). Waiting for confirmation..."
-    result="$(wait_for_autoflash_result)"
-    if [ "$result" = "OK" ]; then
-        echo ""
-        echo "Flash write succeeded. The gateway will reboot automatically."
-        print_complete
-    else
-        if [ "$result" = "FAIL" ]; then
-            echo "Auto-flash reported FAIL. Falling back to manual flash."
-        else
-            echo "No auto-flash confirmation. Falling back to manual flash."
-        fi
-        manual_flw_guidance
-        print_complete
-    fi
+    confirm_and_report
 else
     echo "Bootloader stayed responsive after upload — no auto-flash. Manual flash required."
     manual_flw_guidance

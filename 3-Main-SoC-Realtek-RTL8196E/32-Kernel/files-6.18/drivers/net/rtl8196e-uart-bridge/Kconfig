@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 config RTL8196E_UART_BRIDGE
 	bool "Realtek RTL8196E in-kernel UART<->TCP bridge"
-	depends on MIPS && SERIAL_8250 && INET
+	depends on MIPS && SERIAL_8250 && INET && GPIOLIB
 	help
 	  In-kernel byte shoveler between a TTY port (typically /dev/ttyS1,
 	  the link to the Silabs EFR32 Zigbee/Thread radio) and a listening
@@ -13,6 +13,10 @@ config RTL8196E_UART_BRIDGE
 
 	  Protocol-agnostic: forwards raw bytes in both directions, used by
 	  EZSP (NCP), CPC (RCP), and Spinel (OT-RCP) clients alike.
+
+	  Also provides the nrst_pulse / nrst_gpio sysfs knobs that recover
+	  a stuck radio by pulsing the EFR32 nRST line low through the
+	  gpio-rtl819x chip (hence the GPIOLIB dependency).
 
 	  Must be built in (=y), not as a module. The driver registers at
 	  late_initcall and depends on the tty/serial and net subsystems

@@ -98,7 +98,8 @@ win the next `kernel_accept()`.
 ### Sysfs-only control interface
 
 All knobs (`tty`, `baud`, `port`, `bind_addr`, `flow_control`,
-`enable`) are exposed as module parameters under
+`enable`, `nrst_pulse`, `nrst_gpio`, `status_led_brightness`) are
+exposed as module parameters under
 `/sys/module/rtl8196e_uart_bridge/parameters/`. Writes are applied
 live — the set callbacks teardown and rebuild only the subsystem they
 touch (e.g. changing `baud` reconfigures `ktermios` without dropping
@@ -157,6 +158,47 @@ sysfs knob. `flash_efr32.sh` flips it to `0` for the transfer and
 back to `1` afterwards; the bridge stays armed throughout and the TCP
 listen socket never drops, so nothing on the host side has to
 reconnect.
+
+### Software flow control (v1.2) — XON/XOFF lives in the bridge
+
+Boards without RTS/CTS wiring between the SoC and the radio (e.g. the
+Sengled G4 port, discussions #119/#123) pair a software-flow-control
+radio firmware (NCP-UART-SW) with `flow_control=sw`. Such firmware
+escapes data-plane 0x11/0x13 bytes, so a bare XON/XOFF on the wire is
+genuine flow control.
+
+Two design points:
+
+1. **The bridge handles XON/XOFF itself, not termios.** The hot path
+   bypasses the line discipline (see above), and termios `IXON`/`IXOFF`
+   are implemented by the ldisc — setting them would do nothing. In sw
+   mode `bridge_receive_sw_locked()` scans each UART chunk, strips bare
+   XON/XOFF from the TCP-bound stream and gates the TCP→UART worker
+   via `sw_tx_paused`. A welcome side effect of consuming the control
+   bytes locally: the remote host (Z2M over TCP) sees a clean ASH
+   stream and needs no software-flow-control support of its own.
+2. **The flow control is asymmetric by design.** The bridge *honors*
+   the radio's XOFF (pauses TX up to a bounded 1 s, then fails open and
+   counts `tx_pause_timeouts`) but never *emits* XOFF toward the radio:
+   the UART→TCP direction keeps its historical drop-and-count semantics
+   (`MSG_DONTWAIT`), and at ≤1 Mbaud the 400 MHz SoC never falls behind
+   a 16-byte UART FIFO. The bounded wait also keeps the disarm path's
+   synchronous `kthread_stop()` safe — the worker can never be parked
+   indefinitely on a lost XON.
+
+hw and none modes are untouched: the RX path branches once on the mode
+and takes the exact v1.1 single-send code otherwise.
+
+### DT-seeded defaults (v1.2), module params still in charge
+
+Board ports kept patching the two genuinely board-specific knobs (nRST
+line, flow-control wiring), so v1.2 lets an optional `/radio-bridge` DT
+node seed their boot defaults (see README "Device tree configuration").
+The bridge stays a non-platform driver — converting a field-stable
+driver to platform binding for two values wasn't worth the churn; init
+just looks the node up by compatible. Explicit kernel-cmdline or sysfs
+writes always win over the DT (the param setters record an explicit
+write; built-in modules apply cmdline params before `late_initcall`).
 
 ### nRST pulse — one open-drain GPIO, not a pin-mux trick
 

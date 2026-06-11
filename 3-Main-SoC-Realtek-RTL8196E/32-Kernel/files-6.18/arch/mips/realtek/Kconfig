@@ -27,13 +27,20 @@ choice
 	prompt "Devicetree selection"
 	default DTB_RTK_NONE
 	help
-	  Select the devicetree.
+	  Select the board devicetree built into the kernel image.
+	  Exactly one dtb is linked in (BUILTIN_DTB / __dtb_start).
+
+	  To add a board: write the dts in arch/mips/boot/dts/realtek/
+	  (include rtl819x.dtsi, override memory size, gpio-line-names,
+	  the radio-bridge node and the ethernet interface), add a
+	  choice entry here and the dtb- line in that directory's
+	  Makefile. build_kernel.sh selects the entry via BOARD=<name>.
 
 	config DTB_RTK_NONE
 		bool "None"
 
 	config DTB_RTL8196E_GEN
-		bool "RTL8196E Lidl Gateway"
+		bool "Lidl Silvercrest Gateway (rtl8196e.dtb)"
 		depends on SOC_RTL8196E
 		select BUILTIN_DTB
 

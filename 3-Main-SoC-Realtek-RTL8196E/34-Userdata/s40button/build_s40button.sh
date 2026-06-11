@@ -1,9 +1,10 @@
 #!/bin/sh
 # build_s40button.sh — Build STATIC s40button binary with Lexra toolchain.
 #
-# s40button: front-panel button daemon, polls GPIO 9 and triggers
-# recover_efr32 on a 5 s long-press.  Replaces the busybox shell loop
-# that had an intermittent SIGSEGV in idle polling (v3.2.x/v3.3.0).
+# s40button: front-panel button daemon, polls the reset-button GPIO line
+# (named in the board DTS, fallback line 9) through /dev/gpiochip0 and
+# triggers recover_efr32 on a 5 s long-press.  Replaces the busybox shell
+# loop that had an intermittent SIGSEGV in idle polling (v3.2.x/v3.3.0).
 #
 # See ../s40button/src/s40button.c for the full mechanism documentation.
 #
@@ -22,7 +23,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 SOURCE_DIR="${SCRIPT_DIR}/src"
 INSTALL_DIR="${USERDATA_PART}/skeleton/usr/sbin"
 
-VERSION="1.0"
+VERSION="2.0"
 
 if [ ! -f "${SOURCE_DIR}/s40button.c" ]; then
     echo "Error: source file not found in ${SOURCE_DIR}"

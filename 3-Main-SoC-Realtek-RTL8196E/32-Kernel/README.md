@@ -48,6 +48,21 @@ The result is a clean, maintainable kernel that can be updated to newer 6.18.x p
 | `olddefconfig` | Update `.config` non-interactively against the current Kconfig |
 | `vmlinux` | Build `vmlinux` only (skip packaging) |
 
+### Board selection
+
+The image embeds a single device tree, selected at build time with the
+`BOARD` environment variable (default: `lidl`, the Lidl Silvercrest
+gateway):
+
+```bash
+BOARD=lidl ./build_kernel.sh        # default — builds rtl8196e.dtb
+```
+
+Porting to another RTL8196E board means adding an `rtl8196e-<board>.dts`,
+one Kconfig entry and one Makefile line — the recipe is documented in
+`files-6.18/arch/mips/boot/dts/realtek/Makefile` and in the devicetree
+Kconfig choice (`files-6.18/arch/mips/realtek/Kconfig`).
+
 ### Build process
 
 The script will:

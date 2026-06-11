@@ -5,7 +5,12 @@ RTL8196E SoC (Lexra RLX4181, single-core MIPS-I BE, non-coherent
 writeback L1, 32-byte cache lines, no LWL/LWR, no hardware divide).
 
 Audit date: 2026-04-23. Driver version at audit time: `2.2`.
-Second-pass audit: 2026-05-01 (driver `2.3` → `2.4`); see end of file.
+Second-pass audit: 2026-05-01 (driver `2.3` → `2.4`) and third-pass
+audit: 2026-05-03 (driver `2.4` → `2.5`); see end of file. The later
+driver `2.6` hardening (shadow-skb lookup by hardware mbuf index,
+TX/RX pool-bounds validators) came out of the issue #99 synthesis
+work, not an audit pass — its perf confirmation is in
+`PERFORMANCE.md` (v3.8.0 run).
 Baseline throughput on the Lidl Silvercrest gateway: **~94 Mbit/s RX,
 ~71 Mbit/s TX**.
 
@@ -379,18 +384,14 @@ ssh root@192.168.1.88 'cat /proc/irq/31/spurious'
 
 ## Overlay-sync reminder
 
-Sources in this overlay tree are only copied into
-`../../linux-6.18-rtl8196e/drivers/net/ethernet/rtl8196e-eth/` on a
-fresh extraction. After editing a file here, copy it by hand or the
-incremental build silently rebuilds the stale tree:
-
-```bash
-cp rtl8196e_{main,hw,ring}.c \
-   ../../linux-6.18-rtl8196e/drivers/net/ethernet/rtl8196e-eth/
-```
-
-A `./build_kernel.sh -v 6.18 clean` rebuild avoids this at the cost of
-a ~5-minute rebuild from scratch.
+No manual copy is needed anymore: `build_kernel.sh` rsyncs this
+overlay tree into `../../linux-6.18-rtl8196e/` on **every** run
+(mtime-preserving, so make's incremental rebuild only recompiles what
+actually changed). The historical gotcha — sources copied only on
+fresh extraction, stale tree silently rebuilt — applied to the old
+5.10 flow. `./build_kernel.sh clean` still forces a from-scratch
+re-extract + patch + overlay (~5 minutes) when tree corruption is
+suspected.
 
 ## Second-pass audit (2026-05-01) — driver 2.3 → 2.4
 

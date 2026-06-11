@@ -124,7 +124,11 @@ A platform driver (`compatible = "gpio-leds-pwm"`) that extends the
 
 - Each LED gets one kernel timer firing once per jiffy (250 Hz at HZ=250).
 - PWM period = 4 jiffies → 62.5 Hz (above flicker threshold).
-- `brightness_set(N)` adjusts the duty cycle to `N / 255`.
+- `brightness_set(N)` adjusts the duty cycle to `N / 255`, quantized to
+  the 4 physical levels the 4-jiffy window allows (25/50/75/100 %).
+  Raising the resolution would lower the PWM frequency in the same
+  ratio (8 levels → 31 Hz: visible flicker), so 4 levels at 62.5 Hz is
+  the deliberate trade-off — see issue #120 and the driver header.
 - At `N = 0` or `N = 255` the timer is stopped and the GPIO is held
   steady — no interrupt overhead when full-on or full-off.
 - Existing triggers call `brightness_set()` as usual; the PWM layer is
@@ -183,8 +187,8 @@ leds {
 |------|------|
 | `leds-gpio-pwm.c`                  | Driver source                          |
 | `LED-DESIGN-NOTES.md`              | This document                          |
-| `patches/drivers-leds-Kconfig.patch`| Adds `CONFIG_LEDS_GPIO_PWM` to Kconfig |
-| `patches/drivers-leds-Makefile.patch`| Adds build rule to Makefile           |
+| `patches-6.18/drivers-leds-Kconfig.patch`| Adds `CONFIG_LEDS_GPIO_PWM` to Kconfig |
+| `patches-6.18/drivers-leds-Makefile.patch`| Adds build rule to Makefile           |
 
 ## LAN LED — hardwired to switch ASIC (hardware discovery)
 
@@ -242,20 +246,23 @@ echo MODE=bright > /userdata/etc/leds.conf  # full brightness (default)
 /userdata/etc/init.d/S11leds start
 ```
 
-Internally, `S11leds` sets:
-- **bright**: `DIRECTLCR = default`, `LEDCREG = LEDMODE_DIRECT`, STATUS PWM = 255
-- **dim**: `DIRECTLCR = default`, `LEDCREG = 0` (scan mode), STATUS PWM = 60
+The mode maps onto the two LEDs as follows — the LAN side is applied
+by the Ethernet driver's `led_mode` store (LEDCREG/DIRECTLCR writes),
+the STATUS side by whichever service later takes ownership of the LED:
+- **bright**: `DIRECTLCR = default`, `LEDCREG = LEDMODE_DIRECT`; STATUS PWM target 255
+- **dim**: `DIRECTLCR = default`, `LEDCREG = 0` (scan mode); STATUS PWM target 60
 - **off**: `LEDCREG = 0`, `DIRECTLCR = 0` (LAN LED pin driven low, no
-  residual scan-mode glow), STATUS PWM = 0
+  residual scan-mode glow); STATUS PWM target 0
 
 `S11leds` only writes `led_mode` and forces the STATUS LED to 0 at
 boot. It never lights the STATUS LED itself — doing so at boot used
 to turn the LED on before any radio service was actually ready, which
 operators rightly reported as confusing.
 
-In Thread mode, `S70otbr` reads `/sys/class/net/eth0/led_mode` to
-set the STATUS LED to the right brightness (bright/dim/off) when
-otbr-agent reaches a ready state, and clears it on stop.
+In Thread mode, the `otbr-monitor` housekeeping loop (started and
+supervised by `S70otbr`) reads `/sys/class/net/eth0/led_mode` and sets
+the STATUS LED to the matching brightness (255/60/0) once otbr-agent
+reaches a ready state; `S70otbr stop` clears it.
 
 In Zigbee mode the in-kernel UART bridge drives the STATUS LED via a
 Linux LED trigger named `uart-bridge-client`. The bridge fires the
