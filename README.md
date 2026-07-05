@@ -1,4 +1,4 @@
-# Hacking the Lidl Silvercrest Gateway
+# Hacking the NovaDigital HNZ-CB Gateway
 
 > **If you find this project useful, please consider [giving it a star](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway)!** It helps others discover it and motivates continued development.
 >
